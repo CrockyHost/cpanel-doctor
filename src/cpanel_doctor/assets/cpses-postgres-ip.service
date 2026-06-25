@@ -1,6 +1,6 @@
 [Unit]
 Description=cPanel Doctor: cpses loopback 127.0.0.200 for phpPgAdmin/PostgreSQL
-Documentation=https://github.com/crocky-host/cpanel-doctor
+Documentation=https://github.com/CrockyHost/cpanel-doctor
 After=network-pre.target
 Before=postgresql.service
 DefaultDependencies=no

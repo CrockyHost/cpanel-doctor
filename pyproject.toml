@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cpanel-doctor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Intelligent, interactive doctor that diagnoses, applies and removes fixes (patches) for known cPanel/WHM problems."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -28,8 +28,8 @@ dependencies = [
 dev = ["pytest>=7", "textual-dev>=1.2", "ruff>=0.1"]
 
 [project.urls]
-Homepage = "https://github.com/crocky-host/cpanel-doctor"
-Issues = "https://github.com/crocky-host/cpanel-doctor/issues"
+Homepage = "https://github.com/CrockyHost/cpanel-doctor"
+Issues = "https://github.com/CrockyHost/cpanel-doctor/issues"
 
 [project.scripts]
 cpanel-doctor = "cpanel_doctor.cli:main"
