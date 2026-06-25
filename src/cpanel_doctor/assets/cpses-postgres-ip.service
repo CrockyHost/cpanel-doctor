@@ -1,0 +1,15 @@
+[Unit]
+Description=cPanel Doctor: cpses loopback 127.0.0.200 for phpPgAdmin/PostgreSQL
+Documentation=https://github.com/crocky-host/cpanel-doctor
+After=network-pre.target
+Before=postgresql.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '/sbin/ip addr show dev lo | grep -qw 127.0.0.200 || /sbin/ip addr add 127.0.0.200/32 dev lo'
+ExecStop=-/sbin/ip addr del 127.0.0.200/32 dev lo
+
+[Install]
+WantedBy=multi-user.target

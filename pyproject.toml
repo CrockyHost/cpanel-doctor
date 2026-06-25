@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cpanel-doctor"
+version = "0.1.0"
+description = "Intelligent, interactive doctor that diagnoses, applies and removes fixes (patches) for known cPanel/WHM problems."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "crocky.host" }]
+keywords = ["cpanel", "whm", "postgresql", "phppgadmin", "patch", "sysadmin", "tui"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "textual>=0.40",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "textual-dev>=1.2", "ruff>=0.1"]
+
+[project.urls]
+Homepage = "https://github.com/crocky-host/cpanel-doctor"
+Issues = "https://github.com/crocky-host/cpanel-doctor/issues"
+
+[project.scripts]
+cpanel-doctor = "cpanel_doctor.cli:main"
+cpdoctor = "cpanel_doctor.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cpanel_doctor"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/cpanel_doctor/assets" = "cpanel_doctor/assets"
+
+[tool.hatch.build.targets.sdist]
+include = ["src/cpanel_doctor", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
