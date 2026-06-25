@@ -7,7 +7,6 @@ update, so drifted patches heal themselves.
 """
 from __future__ import annotations
 
-import os
 from typing import Tuple
 
 from .core import Runner, asset_text

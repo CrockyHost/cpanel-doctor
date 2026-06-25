@@ -36,13 +36,11 @@ cpanel-doctor = "cpanel_doctor.cli:main"
 cpdoctor = "cpanel_doctor.cli:main"
 
 [tool.hatch.build.targets.wheel]
+# Assets (.sh/.service/.pl) live inside the package and are included automatically.
 packages = ["src/cpanel_doctor"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/cpanel_doctor/assets" = "cpanel_doctor/assets"
-
 [tool.hatch.build.targets.sdist]
-include = ["src/cpanel_doctor", "README.md", "LICENSE"]
+include = ["src/cpanel_doctor", "README.md", "LICENSE", "PATCHES.md", "CHANGELOG.md"]
 
 [tool.ruff]
 line-length = 100
