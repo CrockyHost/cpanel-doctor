@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 
+from . import enrollment
 from .patch import Component, ComponentStatus, Patch, PatchState
 from .registry import load_patches, patches_by_id
 from .runner import Action, Runner, RunnerError
@@ -16,6 +17,7 @@ __all__ = [
     "Runner",
     "RunnerError",
     "asset_text",
+    "enrollment",
     "load_patches",
     "patches_by_id",
 ]

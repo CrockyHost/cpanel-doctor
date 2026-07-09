@@ -265,3 +265,46 @@ def test_pdns_upcp_remove_never_uninstalls_dns(tmp_path, monkeypatch):
     kinds = [(a.kind, a.target) for a in runner.actions]
     assert all(a.kind != "run" for a in runner.actions), kinds  # nothing executed
     assert patch.state(runner) == PatchState.NOT_APPLIED
+
+
+# --------------------------------------------------------------------------- #
+# self-heal plumbing: enrollment + PATH hardening (the 0.3.1 fixes)
+# --------------------------------------------------------------------------- #
+def test_enrollment_roundtrip(tmp_path, monkeypatch):
+    from cpanel_doctor.core import enrollment
+
+    monkeypatch.setattr(enrollment, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(enrollment, "ENROLLED_FILE", str(tmp_path / "state" / "enrolled"))
+
+    assert enrollment.enrolled_ids() == set()          # missing file -> empty
+    enrollment.enroll("https-redirect-date")
+    enrollment.enroll("pg-cpses")
+    enrollment.enroll("https-redirect-date")            # idempotent
+    assert enrollment.enrolled_ids() == {"https-redirect-date", "pg-cpses"}
+    assert enrollment.is_enrolled("pg-cpses")
+    enrollment.unenroll("pg-cpses")
+    assert enrollment.enrolled_ids() == {"https-redirect-date"}
+    # hand-editable: blanks and comments ignored
+    (tmp_path / "state" / "enrolled").write_text("# note\n\n  foo  \nbar\n")
+    assert enrollment.enrolled_ids() == {"foo", "bar"}
+
+
+def test_runner_path_includes_sbin(monkeypatch):
+    # The post-upcp hook's minimal PATH omits sbin; Runner must add it back so
+    # tools like `ip`/`systemctl` resolve. This is the crash root-cause fix.
+    import shutil
+    from cpanel_doctor.core import runner as runner_mod
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = runner_mod._augmented_env()
+    parts = env["PATH"].split(":")
+    assert "/sbin" in parts and "/usr/sbin" in parts
+    # A capture() for an sbin tool should now actually find it (if present here).
+    if shutil.which("ip", path=env["PATH"]):
+        assert runner_mod.Runner.capture(["ip", "-V"]).returncode == 0
+
+
+def test_https_redirect_date_is_single_component():
+    # Single component => can only be APPLIED/NOT_APPLIED, never DRIFTED, which is
+    # why the old DRIFTED-only reapply never healed it. Enrollment now covers it.
+    assert len(HttpsRedirectDatePatch().components()) == 1

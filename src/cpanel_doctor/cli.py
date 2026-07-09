@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import __version__, hook
-from .core import Action, Patch, PatchState, Runner, load_patches, patches_by_id
+from .core import Action, Patch, PatchState, Runner, enrollment, load_patches, patches_by_id
 
 console = Console()
 
@@ -116,6 +116,13 @@ def _act(args: argparse.Namespace, action: str) -> int:
             continue
         new = patch.state(runner)
         console.print(f"  -> now [{new.color}]{new.label}[/]")
+        # Record the operator's intent so post-upcp `reapply` knows to restore
+        # (or stop restoring) this patch. Never touch enrollment in a dry-run.
+        if not args.dry_run:
+            if action == "remove":
+                enrollment.unenroll(patch.id)
+            elif new == PatchState.APPLIED:
+                enrollment.enroll(patch.id)
     return rc
 
 
@@ -128,19 +135,45 @@ def cmd_remove(args: argparse.Namespace) -> int:
 
 
 def cmd_reapply(args: argparse.Namespace) -> int:
-    """Heal DRIFTED patches only — used by the post-upcp hook."""
+    """Restore enrolled patches that a cPanel update reverted (post-upcp self-heal).
+
+    Heals any *enrolled* patch whose state is not fully APPLIED — this covers both
+    partial resets (DRIFTED) and single-file patches wiped wholesale (NOT_APPLIED),
+    which the old DRIFTED-only logic silently skipped. Each patch is fully isolated:
+    a failure evaluating or applying one patch can never abort the rest of the run.
+    """
     _require_root()
     runner = _runner(args)
-    healed = 0
+    enrolled = enrollment.enrolled_ids()
+    if not enrolled:
+        console.print("[grey50]no enrolled patches to restore[/]")
+        console.print("reapply complete: 0 patch(es) healed")
+        return 0
+
+    healed = failed = 0
     for patch in load_patches():
-        if patch.state(runner) == PatchState.DRIFTED:
-            console.print(f"[yellow]healing drifted patch {patch.id}[/]")
-            try:
-                patch.apply(runner)
+        if patch.id not in enrolled:
+            continue
+        try:
+            applicable, reason = patch.applicable(runner)
+            if not applicable:
+                console.print(f"[grey50]skip {patch.id}: {reason}[/]")
+                continue
+            st = patch.state(runner)
+            if st == PatchState.APPLIED:
+                continue
+            console.print(f"[yellow]restoring {patch.id} ([/]{st.label}[yellow])[/]")
+            patch.apply(runner)
+            if patch.state(runner) == PatchState.APPLIED:
                 healed += 1
-            except Exception as exc:  # noqa: BLE001
-                console.print(f"  [red]error: {exc}[/]")
-    console.print(f"reapply complete: {healed} patch(es) healed")
+            else:
+                failed += 1
+                console.print(f"  [red]{patch.id}: still not fully applied after reapply[/]")
+        except Exception as exc:  # noqa: BLE001 — one bad patch must not abort the batch
+            failed += 1
+            console.print(f"  [red]error healing {patch.id}: {exc}[/]")
+    tail = f" ({failed} failed)" if failed else ""
+    console.print(f"reapply complete: {healed} patch(es) healed{tail}")
     return 0
 
 
@@ -198,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--dry-run", action="store_true", help="preview only")
         sp.add_argument("--yes", action="store_true", help="assume yes (non-interactive)")
 
-    sp = sub.add_parser("reapply", help="re-apply only DRIFTED patches (post-upcp self-heal)")
+    sp = sub.add_parser("reapply", help="restore enrolled patches reverted by an update (post-upcp self-heal)")
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--yes", action="store_true")
 

@@ -3,6 +3,23 @@
 All notable changes to **cPanel Doctor** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.1] — 2026-07-09
+### Fixed
+- **Self-heal now restores single-file patches that a cPanel update reverts.**
+  `reapply` healed only `DRIFTED` patches; a single-component patch (e.g.
+  `https-redirect-date`) wiped wholesale by an update goes to `NOT_APPLIED`, which
+  was silently skipped, so it stayed reverted until re-applied by hand.
+- **A crash in one patch no longer aborts the whole `reapply` run.** Post-upcp
+  hooks run with a minimal PATH where `ip`/`systemctl` aren't found; `pg-cpses`'s
+  state check raised `FileNotFoundError` while `reapply` merely *evaluated* patch
+  state (outside any try/except), killing every self-heal run. Each patch is now
+  fully isolated, and `Runner` hardens the subprocess PATH (adds the sbin dirs) so
+  system tools resolve regardless of the caller's environment. The post-upcp hook
+  also exports a full PATH.
+- Enrollment tracking (`/var/cpanel/cpanel_doctor/enrolled`): `apply` enrolls a
+  patch, `remove` un-enrolls it, and `reapply` restores enrolled-but-reverted
+  patches only — so self-heal never applies patches the operator didn't opt into.
+
 ## [0.3.0] — 2026-07-09
 ### Added
 - `pdns-upcp-removal` patch — fixes **PowerDNS being uninstalled by a cPanel

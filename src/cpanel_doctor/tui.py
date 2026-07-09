@@ -202,18 +202,34 @@ class DoctorApp(App):
                     self.call_from_thread(self.log_write, "[bold]installing post-upcp hook[/]")
                     hook.install(runner)
             elif op == "reapply":
-                self.call_from_thread(self.log_write, "[bold]healing drifted patches[/]")
-                from .core import PatchState
+                self.call_from_thread(self.log_write, "[bold]restoring enrolled patches[/]")
+                from .core import PatchState, enrollment
 
+                enrolled = enrollment.enrolled_ids()
                 for patch in load_patches():
-                    if patch.state(runner) == PatchState.DRIFTED:
-                        self.call_from_thread(self.log_write, f"[yellow]heal {patch.id}[/]")
+                    if patch.id not in enrolled:
+                        continue
+                    try:
+                        if not patch.applicable(runner)[0]:
+                            continue
+                        if patch.state(runner) == PatchState.APPLIED:
+                            continue
+                        self.call_from_thread(self.log_write, f"[yellow]restore {patch.id}[/]")
                         patch.apply(runner)
+                    except Exception as exc:  # noqa: BLE001 — isolate each patch
+                        self.call_from_thread(self.log_write,
+                                              f"[red]error healing {patch.id}: {exc}[/]")
             else:
+                from .core import PatchState, enrollment
+
                 registry = {p.id: p for p in load_patches()}
                 patch = registry[patch_id]
                 self.call_from_thread(self.log_write, f"[bold]{op} {patch.id}[/]")
                 (patch.remove if op == "remove" else patch.apply)(runner)
+                if op == "remove":
+                    enrollment.unenroll(patch.id)
+                elif patch.state(runner) == PatchState.APPLIED:
+                    enrollment.enroll(patch.id)
                 ok, msg = patch.self_test(runner) if op == "apply" else (True, "")
                 if op == "apply":
                     self.call_from_thread(self.log_write,

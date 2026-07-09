@@ -14,6 +14,23 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
 
 
+# cPanel runs hooks (and thus `reapply`) with a minimal PATH that omits the sbin
+# dirs, so bare tools like `ip` and `systemctl` fail with FileNotFoundError. Every
+# subprocess we spawn gets a PATH that always includes the standard admin dirs so
+# patches can call system tools by name without each one hard-coding absolute paths.
+_STD_BIN_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/sbin", "/usr/bin", "/bin")
+
+
+def _augmented_env() -> dict:
+    env = dict(os.environ)
+    parts = [p for p in env.get("PATH", "").split(":") if p]
+    for d in _STD_BIN_DIRS:
+        if d not in parts:
+            parts.append(d)
+    env["PATH"] = ":".join(parts)
+    return env
+
+
 @dataclass
 class Action:
     kind: str          # "run" | "write" | "remove" | "chmod" | "backup" | "restore" | "note"
@@ -71,6 +88,7 @@ class Runner:
             text=True,
             timeout=timeout,
             check=False,
+            env=_augmented_env(),
         )
 
     # -- mutating operations ------------------------------------------------
@@ -78,7 +96,10 @@ class Runner:
         pretty = " ".join(cmd)
         if self.dry_run:
             return self._record(Action("run", pretty, detail="(dry-run)"))
-        proc = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(
+            list(cmd), capture_output=True, text=True, timeout=timeout, check=False,
+            env=_augmented_env(),
+        )
         out = (proc.stdout or "") + (proc.stderr or "")
         action = Action("run", pretty, ok=proc.returncode == 0, output=out.strip())
         self._record(action)
