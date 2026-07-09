@@ -4,8 +4,10 @@ from __future__ import annotations
 from cpanel_doctor.core import Patch, PatchState, Runner, load_patches, patches_by_id
 from cpanel_doctor.patches import account_startdate as asd
 from cpanel_doctor.patches import https_redirect_date as hrd
+from cpanel_doctor.patches import pdns_upcp_removal as puc
 from cpanel_doctor.patches.account_startdate import AccountStartdatePatch
 from cpanel_doctor.patches.https_redirect_date import HttpsRedirectDatePatch
+from cpanel_doctor.patches.pdns_upcp_removal import PdnsUpcpRemovalPatch
 from cpanel_doctor.patches.pg_cpses import PgCpsesPatch
 
 
@@ -17,6 +19,7 @@ def test_patches_discovered():
     assert "pg-cpses" in registry
     assert "https-redirect-date" in registry
     assert "account-startdate" in registry
+    assert "pdns-upcp-removal" in registry
 
 
 def test_pg_cpses_components_well_formed():
@@ -160,3 +163,105 @@ def test_https_redirect_date_refuses_changed_build(tmp_path, monkeypatch):
     runner = Runner()
     assert patch.applicable(runner)[0] is False
     assert patch.state(runner) == PatchState.NOT_APPLICABLE
+
+
+def test_pdns_upcp_components_well_formed():
+    patch = PdnsUpcpRemovalPatch()
+    comps = patch.components()
+    assert [c.key for c in comps] == ["guard", "pdns_pkg"]
+    for c in comps:
+        assert callable(c.present) and callable(c.apply) and callable(c.remove)
+
+
+def test_pdns_upcp_not_applicable_off_cpanel(tmp_path, monkeypatch):
+    # No setupnameserver script -> not a cPanel host -> NOT_APPLICABLE, never crash.
+    monkeypatch.setattr(puc, "SETUP_NAMESERVER", str(tmp_path / "nope"))
+    patch = PdnsUpcpRemovalPatch()
+    runner = Runner()
+    assert patch.applicable(runner)[0] is False
+    assert patch.state(runner) == PatchState.NOT_APPLICABLE
+
+
+def test_pdns_upcp_not_applicable_on_non_powerdns(tmp_path, monkeypatch):
+    # A bind/nsd/disabled host must never be switched to PowerDNS by this patch.
+    setup = tmp_path / "setupnameserver"
+    setup.write_text("#!/bin/sh\n")
+    cfg = tmp_path / "cpanel.config"
+    cfg.write_text("local_nameserver_type=bind\n")
+    monkeypatch.setattr(puc, "SETUP_NAMESERVER", str(setup))
+    monkeypatch.setattr(puc, "CPANEL_CONFIG", str(cfg))
+    patch = PdnsUpcpRemovalPatch()
+    runner = Runner()
+    ok, reason = patch.applicable(runner)
+    assert ok is False and "powerdns" in reason
+    assert patch.state(runner) == PatchState.NOT_APPLICABLE
+
+
+def _pdns_env(tmp_path, monkeypatch):
+    """A PowerDNS-configured cPanel host with tunable package presence."""
+    setup = tmp_path / "setupnameserver"
+    setup.write_text("#!/bin/sh\n")
+    cfg = tmp_path / "cpanel.config"
+    cfg.write_text("local_nameserver_type=powerdns\n")
+    guard = tmp_path / "pdns-guard"
+    monkeypatch.setattr(puc, "SETUP_NAMESERVER", str(setup))
+    monkeypatch.setattr(puc, "CPANEL_CONFIG", str(cfg))
+    monkeypatch.setattr(puc, "GUARD", str(guard))
+    return guard
+
+
+def test_pdns_upcp_state_machine(tmp_path, monkeypatch):
+    guard = _pdns_env(tmp_path, monkeypatch)
+    installed = {"v": True}
+    monkeypatch.setattr(puc, "_pdns_installed", lambda r: installed["v"])
+
+    patch = PdnsUpcpRemovalPatch()
+    runner = Runner()
+
+    # Un-armed host (pdns installed, no guard) must NOT auto-arm itself.
+    assert patch.state(runner) == PatchState.NOT_APPLIED
+
+    # Armed + package present -> fully APPLIED.
+    guard.write_text("armed")
+    assert patch.state(runner) == PatchState.APPLIED
+
+    # upcp removes the package: guard survives, package gone -> DRIFTED,
+    # which is exactly what makes the post-upcp `reapply` heal it.
+    installed["v"] = False
+    assert patch.state(runner) == PatchState.DRIFTED
+
+    # Disarmed (guard also gone) -> back to NOT_APPLIED.
+    guard.unlink()
+    assert patch.state(runner) == PatchState.NOT_APPLIED
+
+
+def test_pdns_upcp_apply_plans_guard_then_reinstall(tmp_path, monkeypatch):
+    # A dry-run apply on a host whose package was removed must plan BOTH the
+    # guard marker and the setupnameserver reinstall, and touch nothing.
+    guard = _pdns_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(puc, "_pdns_installed", lambda r: False)
+
+    patch = PdnsUpcpRemovalPatch()
+    runner = Runner(dry_run=True)
+    patch.apply(runner)
+
+    targets = [a.target for a in runner.actions]
+    assert str(guard) in targets
+    assert any("setupnameserver --force powerdns" in t for t in targets)
+    assert not guard.exists()  # dry-run changed nothing
+
+
+def test_pdns_upcp_remove_never_uninstalls_dns(tmp_path, monkeypatch):
+    # Removing the patch disarms the guard but must never uninstall PowerDNS.
+    guard = _pdns_env(tmp_path, monkeypatch)
+    guard.write_text("armed")
+    monkeypatch.setattr(puc, "_pdns_installed", lambda r: True)
+
+    patch = PdnsUpcpRemovalPatch()
+    runner = Runner()
+    patch.remove(runner)
+
+    assert not guard.exists()                       # guard disarmed
+    kinds = [(a.kind, a.target) for a in runner.actions]
+    assert all(a.kind != "run" for a in runner.actions), kinds  # nothing executed
+    assert patch.state(runner) == PatchState.NOT_APPLIED

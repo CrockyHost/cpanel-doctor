@@ -9,6 +9,7 @@ detection, idempotent apply, surgical re-apply and clean removal all come for fr
 |----|-------|
 | [`account-startdate`](#account-startdate--new-accounts-get-a-past-creation-date) | new accounts recorded with a creation date in the past |
 | [`https-redirect-date`](#https-redirect-date--force-https-redirect-greyed-out) | greyed-out **Force HTTPS Redirect** toggle |
+| [`pdns-upcp-removal`](#pdns-upcp-removal--powerdns-uninstalled-by-a-cpanel-update) | PowerDNS uninstalled by a cPanel update, DNS down |
 | [`pg-cpses`](#pg-cpses--phppgadmin--postgresql-cpses-login) | phpPgAdmin *"Authentication failed"* (broken `pam_cpses.so`) |
 
 ---
@@ -44,6 +45,33 @@ back to `time()` if the clock can't be read.
 Single component `ssl_call`: the vendor file is edited in place (original backed
 up to `ssl_call.pm.orig`). A cPanel update overwrites it → the patch reads as
 **NOT APPLIED** and is restored by `reapply` / the post-upcp hook.
+
+## `pdns-upcp-removal` — PowerDNS uninstalled by a cPanel update
+On a host whose authoritative nameserver is PowerDNS
+(`local_nameserver_type=powerdns`), a cPanel update (`/scripts/upcp`) can decide
+the `cpanel-pdns` package is *unneeded* and remove it mid-run — the upcp log shows
+`Uninstalling unneeded rpms: cpanel-pdns` and `pdns.conf saved as
+pdns.conf.rpmsave`. The package, the `/usr/sbin/pdns_server` binary and the
+`pdns.service` unit all vanish, nothing listens on port 53, and **every** domain
+on the box stops resolving. `chkservd` can't recover it — it restarts a stopped
+service, it does not reinstall a deleted package — so the outage lasts until
+someone reinstalls PowerDNS by hand (seen after major bumps like `…cp130`).
+
+The patch reinstalls and reconfigures PowerDNS with the supported command
+`setupnameserver --force powerdns` (which reinstalls `cpanel-pdns`, regenerates
+`/etc/pdns/pdns.conf`, re-enables/starts the service and restores monitoring;
+`/var/named` zone files are untouched). The trick is *when* it runs: it is modelled
+so that a package removal reads as **DRIFTED**, and cPanel Doctor's existing
+post-upcp self-heal hook (which runs `reapply`, healing drifted patches) fires it
+automatically after the very update that removed PowerDNS.
+
+Components `guard` (a marker under `/var/lib/cpanel-doctor` that survives upcp —
+its persistence is what makes a removal read as DRIFTED rather than NOT-APPLIED,
+so `reapply` picks it up) and `pdns_pkg` (present only while armed **and**
+`cpanel-pdns` installed; healed via `setupnameserver --force`). `applicable()`
+only returns true on hosts already set to PowerDNS, so it never converts a
+bind/nsd/disabled host; and `pdns_pkg`'s removal is a deliberate no-op, so
+removing the patch merely disarms the guard and **never** uninstalls DNS.
 
 ## `pg-cpses` — phpPgAdmin / PostgreSQL cpses login
 On affected builds the vendor `pam_cpses.so` rejects **every** valid PostgreSQL

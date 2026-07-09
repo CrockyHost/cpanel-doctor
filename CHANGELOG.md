@@ -3,6 +3,21 @@
 All notable changes to **cPanel Doctor** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] — 2026-07-09
+### Added
+- `pdns-upcp-removal` patch — fixes **PowerDNS being uninstalled by a cPanel
+  update**. On a PowerDNS host (`local_nameserver_type=powerdns`), `upcp` can
+  classify `cpanel-pdns` as "unneeded" and remove it mid-run (*"Uninstalling
+  unneeded rpms: cpanel-pdns"*), deleting the package, the `pdns_server` binary
+  and the `pdns.service` unit — nothing then listens on port 53 and every domain
+  on the box stops resolving, with `chkservd` unable to help (the package is
+  gone, not just stopped). The patch arms a persistent guard so such a removal
+  reads as **DRIFTED**, and the post-upcp self-heal hook reinstalls PowerDNS via
+  `setupnameserver --force powerdns` (regenerating the config, restarting the
+  service and restoring monitoring; zone files in `/var/named` are untouched).
+  Components `guard` and `pdns_pkg`; only arms on hosts already set to PowerDNS
+  and never uninstalls DNS on removal.
+
 ## [0.2.0] — 2026-06-26
 ### Added
 - `account-startdate` patch — fixes newly created cPanel accounts being recorded
