@@ -61,13 +61,15 @@ It registers a cPanel Standardized Hook on `System::upcp` (post stage) that runs
 
 ## Patches
 
-Three patches ship today — see **[PATCHES.md](PATCHES.md)** for full descriptions,
+Five patches ship today — see **[PATCHES.md](PATCHES.md)** for full descriptions,
 security notes and a guide to writing your own.
 
 | ID | Fixes |
 |----|-------|
 | `account-startdate` | new accounts recorded with a creation date in the past |
 | `https-redirect-date` | greyed-out **Force HTTPS Redirect** toggle |
+| `mail-sni-sync` | secure IMAP/SMTP presenting the server hostname cert on `mail.<domain>` |
+| `pdns-upcp-removal` | PowerDNS uninstalled by a cPanel update, DNS down |
 | `pg-cpses` | phpPgAdmin *"Authentication failed"* (broken `pam_cpses.so`) |
 
 New patches are auto-discovered — drop a `Patch` subclass in

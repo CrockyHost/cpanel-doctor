@@ -3,6 +3,21 @@
 All notable changes to **cPanel Doctor** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0] — 2026-07-28
+### Added
+- `mail-sni-sync` patch — fixes **mail services presenting the server hostname
+  certificate instead of the domain's**. When a domain has a valid CA certificate
+  for its website but its Mail SNI entry was never (re)built, Dovecot and Exim keep
+  serving the box's hostname cert on `mail.<domain>`, so certificate-validating
+  clients (Outlook, Apple Mail, phones) reject the secure IMAP/POP/SMTP ports
+  (993/995/465/587) with a name mismatch and fall back to plaintext or fail to
+  connect. The patch detects any main/addon/parked domain that owns a real
+  certificate yet is missing from `/etc/dovecot/sni.conf` — ignoring web-only
+  subdomains and self-signed placeholders, which cPanel intentionally leaves out —
+  and heals it with `build_mail_sni --rebuild_dovecot_sni_conf --restartsrvs`.
+  Enrolled on apply, so the post-upcp self-heal hook re-syncs mail SNI after
+  updates or certificate renewals that desync it.
+
 ## [0.3.1] — 2026-07-09
 ### Fixed
 - **Self-heal now restores single-file patches that a cPanel update reverts.**

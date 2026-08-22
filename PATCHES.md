@@ -9,6 +9,7 @@ detection, idempotent apply, surgical re-apply and clean removal all come for fr
 |----|-------|
 | [`account-startdate`](#account-startdate--new-accounts-get-a-past-creation-date) | new accounts recorded with a creation date in the past |
 | [`https-redirect-date`](#https-redirect-date--force-https-redirect-greyed-out) | greyed-out **Force HTTPS Redirect** toggle |
+| [`mail-sni-sync`](#mail-sni-sync--mail-ports-present-the-wrong-hostname-certificate) | secure IMAP/SMTP presenting the server hostname cert on `mail.<domain>` |
 | [`pdns-upcp-removal`](#pdns-upcp-removal--powerdns-uninstalled-by-a-cpanel-update) | PowerDNS uninstalled by a cPanel update, DNS down |
 | [`pg-cpses`](#pg-cpses--phppgadmin--postgresql-cpses-login) | phpPgAdmin *"Authentication failed"* (broken `pam_cpses.so`) |
 
@@ -45,6 +46,37 @@ back to `time()` if the clock can't be read.
 Single component `ssl_call`: the vendor file is edited in place (original backed
 up to `ssl_call.pm.orig`). A cPanel update overwrites it → the patch reads as
 **NOT APPLIED** and is restored by `reapply` / the post-upcp hook.
+
+## `mail-sni-sync` — mail ports present the wrong (hostname) certificate
+When a domain has a valid CA certificate for its **website**, cPanel is supposed
+to wire that same certificate into the mail services via **Mail SNI** — copying it
+to `/var/cpanel/ssl/domain_tls/<domain>/` and adding a `local_name` block to
+`/etc/dovecot/sni.conf` so Dovecot (IMAP/POP) and Exim (SMTP) hand out the
+*domain's* cert when a client connects to `mail.<domain>` over TLS. Occasionally
+the cert is installed (typically by AutoSSL) but the SNI entry is not rebuilt for
+it, so the mail ports keep presenting the **server hostname** certificate:
+
+```
+$ openssl s_client -connect mail.example.com:993 -servername mail.example.com | openssl x509 -noout -subject
+subject=CN = server-hostname.example-host.net     # wrong: not mail.example.com
+```
+
+Because the presented name doesn't match `mail.example.com`, certificate-validating
+clients (Outlook, Apple Mail, Thunderbird, phones) refuse the secure IMAP/POP/SMTP
+ports (993 / 995 / 465 / 587) with a name-mismatch error and fall back to plaintext
+or fail to connect. The services themselves are fine — only the certificate handed
+out for the domain is wrong.
+
+Single component `sni_synced`: reports **present** only while every cPanel-managed
+**main/addon/parked** domain that owns a *CA-issued* web certificate also appears in
+`/etc/dovecot/sni.conf`. Web-only subdomains (type `sub`) and self-signed
+placeholders are excluded — cPanel deliberately gives those no mail SNI, so a
+healthy host reads cleanly **APPLIED**. Healing runs
+`build_mail_sni --rebuild_dovecot_sni_conf --restartsrvs`, which regenerates the
+SNI include and restarts Dovecot/Exim. Applying enrolls the patch, so the
+post-upcp hook's `reapply` re-syncs mail SNI after an update or a certificate
+renewal that leaves a domain out. Removal only stops the self-heal — it never
+strips a certificate back off the mail ports.
 
 ## `pdns-upcp-removal` — PowerDNS uninstalled by a cPanel update
 On a host whose authoritative nameserver is PowerDNS

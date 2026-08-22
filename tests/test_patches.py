@@ -5,9 +5,11 @@ from cpanel_doctor.core import Patch, PatchState, Runner, load_patches, patches_
 from cpanel_doctor.patches import account_startdate as asd
 from cpanel_doctor.patches import https_redirect_date as hrd
 from cpanel_doctor.patches import pdns_upcp_removal as puc
+from cpanel_doctor.patches import mail_sni_sync as mss
 from cpanel_doctor.patches.account_startdate import AccountStartdatePatch
 from cpanel_doctor.patches.https_redirect_date import HttpsRedirectDatePatch
 from cpanel_doctor.patches.pdns_upcp_removal import PdnsUpcpRemovalPatch
+from cpanel_doctor.patches.mail_sni_sync import MailSniSyncPatch
 from cpanel_doctor.patches.pg_cpses import PgCpsesPatch
 
 
@@ -20,6 +22,7 @@ def test_patches_discovered():
     assert "https-redirect-date" in registry
     assert "account-startdate" in registry
     assert "pdns-upcp-removal" in registry
+    assert "mail-sni-sync" in registry
 
 
 def test_pg_cpses_components_well_formed():
@@ -308,3 +311,116 @@ def test_https_redirect_date_is_single_component():
     # Single component => can only be APPLIED/NOT_APPLIED, never DRIFTED, which is
     # why the old DRIFTED-only reapply never healed it. Enrollment now covers it.
     assert len(HttpsRedirectDatePatch().components()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# mail-sni-sync: mail ports must present the domain cert, not the hostname cert
+# --------------------------------------------------------------------------- #
+def test_mail_sni_components_well_formed():
+    patch = MailSniSyncPatch()
+    comps = patch.components()
+    assert [c.key for c in comps] == ["sni_synced"]
+    for c in comps:
+        assert callable(c.present) and callable(c.apply) and callable(c.remove)
+
+
+def test_mail_sni_not_applicable_off_cpanel(tmp_path, monkeypatch):
+    # No build_mail_sni script -> not a cPanel host -> NOT_APPLICABLE, never crash.
+    monkeypatch.setattr(mss, "BUILD_MAIL_SNI", str(tmp_path / "nope"))
+    patch = MailSniSyncPatch()
+    runner = Runner()
+    assert patch.applicable(runner)[0] is False
+    assert patch.state(runner) == PatchState.NOT_APPLICABLE
+
+
+def _sni_env(tmp_path, monkeypatch, userdata: str, sni: str, ca_domains):
+    """A fake cPanel mail-SNI environment with tunable inputs.
+
+    ``ca_domains`` is the set of domains whose apache_tls ``combined`` is treated
+    as a real (CA-issued) certificate; anything else is considered self-signed.
+    """
+    build = tmp_path / "build_mail_sni"
+    build.write_text("#!/bin/sh\n")
+    dovecot = tmp_path / "dovecot"
+    dovecot.mkdir()
+    sni_conf = dovecot / "sni.conf"
+    sni_conf.write_text(sni)
+    userdata_file = tmp_path / "userdatadomains"
+    userdata_file.write_text(userdata)
+    apache_tls = tmp_path / "apache_tls"
+    # Give every domain that appears in userdata a placeholder combined file so the
+    # CA-vs-self-signed decision is driven purely by the monkeypatched checker.
+    for line in userdata.splitlines():
+        dom = line.split(":", 1)[0].strip()
+        if dom:
+            (apache_tls / dom).mkdir(parents=True, exist_ok=True)
+            (apache_tls / dom / "combined").write_text("cert")
+
+    monkeypatch.setattr(mss, "BUILD_MAIL_SNI", str(build))
+    monkeypatch.setattr(mss, "SNI_CONF", str(sni_conf))
+    monkeypatch.setattr(mss, "USERDATADOMAINS", str(userdata_file))
+    monkeypatch.setattr(mss, "APACHE_TLS_DIR", str(apache_tls))
+    monkeypatch.setattr(mss, "_is_ca_signed", lambda r, path: any(f"/{d}/" in path for d in ca_domains))
+
+
+# A realistic slice: two mail-bearing main domains, a web-only sub, and a
+# self-signed placeholder main. Only `good.example` is wired into mail SNI.
+_USERDATA = (
+    "good.example: alice==alice==main==good.example==/home/alice/public_html==1.2.3.4\n"
+    "broken.example: bob==bob==main==broken.example==/home/bob/public_html==1.2.3.4\n"
+    "landing.good.example: alice==alice==sub==good.example==/home/alice/l==1.2.3.4\n"
+    "placeholder.example: root==root==main==placeholder.example==/home/x==1.2.3.4\n"
+)
+_SNI_ONLY_GOOD = (
+    'local_name "good.example" {\n  ssl_server_cert_file = /x\n}\n'
+    'local_name "*.good.example" {\n  ssl_server_cert_file = /x\n}\n'
+)
+
+
+def test_mail_sni_drift_when_ca_domain_missing(tmp_path, monkeypatch):
+    # broken.example has a real cert but no SNI block -> patch reads NOT_APPLIED
+    # (single component) and self_test names the offending domain.
+    _sni_env(tmp_path, monkeypatch, _USERDATA, _SNI_ONLY_GOOD,
+             ca_domains={"good.example", "broken.example"})
+    patch = MailSniSyncPatch()
+    runner = Runner()
+    assert patch.applicable(runner)[0] is True
+    assert mss._domains_missing_from_sni(runner) == ["broken.example"]
+    assert patch.state(runner) == PatchState.NOT_APPLIED
+    ok, msg = patch.self_test(runner)
+    assert ok is False and "broken.example" in msg
+
+
+def test_mail_sni_ignores_subdomains_and_selfsigned(tmp_path, monkeypatch):
+    # With broken.example also wired into SNI, nothing should remain missing:
+    # the web-only `sub` domain and the self-signed `placeholder` main are both
+    # correctly excluded, so the patch reads APPLIED (no false positives).
+    sni = _SNI_ONLY_GOOD + 'local_name "broken.example" {\n  ssl_server_cert_file = /x\n}\n'
+    _sni_env(tmp_path, monkeypatch, _USERDATA, sni,
+             ca_domains={"good.example", "broken.example"})  # placeholder stays self-signed
+    patch = MailSniSyncPatch()
+    runner = Runner()
+    assert mss._domains_missing_from_sni(runner) == []
+    assert patch.state(runner) == PatchState.APPLIED
+
+
+def test_mail_sni_apply_runs_build_and_is_dry_safe(tmp_path, monkeypatch):
+    # A dry-run apply must plan the build_mail_sni rebuild and change nothing.
+    _sni_env(tmp_path, monkeypatch, _USERDATA, _SNI_ONLY_GOOD,
+             ca_domains={"good.example", "broken.example"})
+    patch = MailSniSyncPatch()
+    runner = Runner(dry_run=True)
+    patch.apply(runner)
+    ran = [a.target for a in runner.actions if a.kind == "run"]
+    assert any("build_mail_sni" in t and "--rebuild_dovecot_sni_conf" in t for t in ran)
+
+
+def test_mail_sni_remove_never_strips_certs(tmp_path, monkeypatch):
+    # Removing the patch must not execute anything (it only stops self-heal).
+    sni = _SNI_ONLY_GOOD + 'local_name "broken.example" {\n  ssl_server_cert_file = /x\n}\n'
+    _sni_env(tmp_path, monkeypatch, _USERDATA, sni,
+             ca_domains={"good.example", "broken.example"})
+    patch = MailSniSyncPatch()
+    runner = Runner()
+    patch.remove(runner)
+    assert all(a.kind != "run" for a in runner.actions)
