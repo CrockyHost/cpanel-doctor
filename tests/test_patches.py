@@ -6,10 +6,14 @@ from cpanel_doctor.patches import account_startdate as asd
 from cpanel_doctor.patches import https_redirect_date as hrd
 from cpanel_doctor.patches import pdns_upcp_removal as puc
 from cpanel_doctor.patches import mail_sni_sync as mss
+from cpanel_doctor.patches import lshttpd_pidfile as lpf
+from cpanel_doctor.patches import lsws_suspend_reload as lsr
 from cpanel_doctor.patches.account_startdate import AccountStartdatePatch
 from cpanel_doctor.patches.https_redirect_date import HttpsRedirectDatePatch
 from cpanel_doctor.patches.pdns_upcp_removal import PdnsUpcpRemovalPatch
 from cpanel_doctor.patches.mail_sni_sync import MailSniSyncPatch
+from cpanel_doctor.patches.lshttpd_pidfile import LshttpdPidfilePatch
+from cpanel_doctor.patches.lsws_suspend_reload import LswsSuspendReloadPatch
 from cpanel_doctor.patches.pg_cpses import PgCpsesPatch
 
 
@@ -23,6 +27,8 @@ def test_patches_discovered():
     assert "account-startdate" in registry
     assert "pdns-upcp-removal" in registry
     assert "mail-sni-sync" in registry
+    assert "lsws-suspend-reload" in registry
+    assert "lshttpd-pidfile" in registry
 
 
 def test_pg_cpses_components_well_formed():
@@ -424,3 +430,207 @@ def test_mail_sni_remove_never_strips_certs(tmp_path, monkeypatch):
     runner = Runner()
     patch.remove(runner)
     assert all(a.kind != "run" for a in runner.actions)
+
+
+# --------------------------------------------------------------------------- #
+# lsws-suspend-reload: a suspended account must stop being served
+# --------------------------------------------------------------------------- #
+
+# A realistic `manage_hooks list` slice: our script under both account events,
+# other vendors' hooks under the same and neighbouring events.
+_HOOK_LISTING = """Whostmgr:
+	Accounts::suspendacct:
+		weight: 100
+		hook: /usr/local/cpanel/3rdparty/wp-toolkit/bin/handle-event
+		stage: pre
+		--
+		weight: 900
+		hook: /usr/local/cpanel/scripts/cpanel_doctor_lsws_suspend_reload.sh
+		stage: post
+	Accounts::unsuspendacct:
+		weight: 900
+		hook: /usr/local/cpanel/scripts/cpanel_doctor_lsws_suspend_reload.sh
+		stage: post
+	Accounts::Create:
+		weight: 100
+		hook: /usr/local/cpanel/scripts/cpanel_doctor_account_startdate.pl
+		stage: post
+"""
+
+
+def test_lsws_suspend_components_well_formed():
+    patch = LswsSuspendReloadPatch()
+    comps = patch.components()
+    assert [c.key for c in comps] == ["hook_script", "hook_suspend", "hook_unsuspend"]
+    for c in comps:
+        assert callable(c.present) and callable(c.apply) and callable(c.remove)
+
+
+def test_lsws_suspend_hook_listing_parser():
+    # Both account events must be recognised for our script, and only ours --
+    # another vendor's hook under the same event must not be mistaken for it.
+    events = lsr._parse_registered_events(_HOOK_LISTING, lsr.HOOK_PATH)
+    assert events == {"Accounts::suspendacct", "Accounts::unsuspendacct"}
+    other = lsr._parse_registered_events(
+        _HOOK_LISTING, "/usr/local/cpanel/scripts/cpanel_doctor_account_startdate.pl"
+    )
+    assert other == {"Accounts::Create"}
+    assert lsr._parse_registered_events(_HOOK_LISTING, "/nope") == set()
+
+
+def test_lsws_suspend_not_applicable_without_litespeed(tmp_path, monkeypatch):
+    # On an Apache host the include is re-read normally, so there is nothing to fix.
+    hooks = tmp_path / "manage_hooks"
+    hooks.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(lsr, "MANAGE_HOOKS", str(hooks))
+    monkeypatch.setattr(lsr, "LSWSCTRL", str(tmp_path / "nope"))
+    patch = LswsSuspendReloadPatch()
+    runner = Runner()
+    ok, reason = patch.applicable(runner)
+    assert ok is False and "LiteSpeed" in reason
+    assert patch.state(runner) == PatchState.NOT_APPLICABLE
+
+
+def test_lsws_suspend_not_applicable_off_cpanel(tmp_path, monkeypatch):
+    monkeypatch.setattr(lsr, "MANAGE_HOOKS", str(tmp_path / "nope"))
+    patch = LswsSuspendReloadPatch()
+    assert patch.applicable(Runner())[0] is False
+
+
+def test_lsws_suspend_script_roundtrip(tmp_path, monkeypatch):
+    # The managed script is written with its marker and removed cleanly.
+    script = tmp_path / "reload.sh"
+    monkeypatch.setattr(lsr, "HOOK_PATH", str(script))
+
+    patch = LswsSuspendReloadPatch()
+    runner = Runner()
+    comp = {c.key: c for c in patch.components()}["hook_script"]
+
+    assert comp.present(runner) is False
+    comp.apply(runner)
+    assert comp.present(runner) is True
+    body = script.read_text()
+    assert lsr.MARKER in body
+    assert "MODE=graceful" in body          # zero-downtime default
+    assert "flock" in body                  # bulk suspensions must not stack restarts
+    comp.remove(runner)
+    assert comp.present(runner) is False
+
+
+def test_lsws_suspend_dry_run_registers_both_events(tmp_path, monkeypatch):
+    # A dry-run apply must plan the script plus BOTH hook registrations, and
+    # touch nothing on disk.
+    script = tmp_path / "reload.sh"
+    hooks = tmp_path / "manage_hooks"
+    hooks.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(lsr, "HOOK_PATH", str(script))
+    monkeypatch.setattr(lsr, "MANAGE_HOOKS", str(hooks))
+    monkeypatch.setattr(lsr, "_registered_events", lambda r, p: set())
+
+    patch = LswsSuspendReloadPatch()
+    runner = Runner(dry_run=True)
+    patch.apply(runner)
+
+    ran = [a.target for a in runner.actions if a.kind == "run"]
+    assert any("Accounts::suspendacct" in t for t in ran)
+    assert any("Accounts::unsuspendacct" in t for t in ran)
+    assert not script.exists()
+
+
+def test_lsws_suspend_detects_server_older_than_suspensions(tmp_path, monkeypatch):
+    # The signature of the bug: LiteSpeed started before the suspensions file was
+    # last written, so it has never read the current suspensions.
+    conf = tmp_path / "account_suspensions.conf"
+    conf.write_text('<Directory "/home/bob">\n</Directory>\n')
+    monkeypatch.setattr(lsr, "SUSPENSIONS_CONF", str(conf))
+    runner = Runner()
+
+    mtime = conf.stat().st_mtime
+    monkeypatch.setattr(lsr, "_lsws_start_epoch", lambda r: int(mtime) - 3600)
+    assert lsr._stale_suspensions(runner) is True      # server older -> stale
+    monkeypatch.setattr(lsr, "_lsws_start_epoch", lambda r: int(mtime) + 3600)
+    assert lsr._stale_suspensions(runner) is False     # restarted since -> current
+    monkeypatch.setattr(lsr, "_lsws_start_epoch", lambda r: None)
+    assert lsr._stale_suspensions(runner) is None      # undeterminable, never crash
+
+
+def test_lsws_suspend_pidfile_read_from_lswsctrl(tmp_path, monkeypatch):
+    # The PID path must be read from lswsctrl, not assumed to be /var/run.
+    ctrl = tmp_path / "lswsctrl"
+    ctrl.write_text("#!/bin/sh\nPIDFILE=/tmp/lshttpd/lshttpd.pid\n")
+    monkeypatch.setattr(lsr, "LSWSCTRL", str(ctrl))
+    assert lsr._lsws_pidfile(Runner()) == "/tmp/lshttpd/lshttpd.pid"
+
+
+# --------------------------------------------------------------------------- #
+# lshttpd-pidfile: the unit must point at the PID file lswsctrl really writes
+# --------------------------------------------------------------------------- #
+def _pidfile_env(tmp_path, monkeypatch, declared: str, real: str = "/tmp/lshttpd/lshttpd.pid"):
+    """A LiteSpeed host whose unit declares ``declared`` while lswsctrl writes ``real``."""
+    ctrl = tmp_path / "lswsctrl"
+    ctrl.write_text(f"#!/bin/sh\nPIDFILE={real}\n")
+    unit = tmp_path / "lshttpd.service"
+    unit.write_text(f"[Service]\nType=forking\nPIDFile={declared}\n")
+    dropin = tmp_path / "dropin.conf"
+    monkeypatch.setattr(lpf, "LSWSCTRL", str(ctrl))
+    monkeypatch.setattr(lpf, "DROPIN", str(dropin))
+    monkeypatch.setattr(lpf, "_unit_fragment_path", lambda r: str(unit))
+    return dropin
+
+
+def test_lshttpd_pidfile_components_well_formed():
+    patch = LshttpdPidfilePatch()
+    comps = patch.components()
+    assert [c.key for c in comps] == ["pidfile_override"]
+    for c in comps:
+        assert callable(c.present) and callable(c.apply) and callable(c.remove)
+
+
+def test_lshttpd_pidfile_not_applicable_when_unit_is_correct(tmp_path, monkeypatch):
+    # A LiteSpeed build that ships the right path must be left alone.
+    _pidfile_env(tmp_path, monkeypatch, declared="/tmp/lshttpd/lshttpd.pid")
+    patch = LshttpdPidfilePatch()
+    runner = Runner()
+    ok, reason = patch.applicable(runner)
+    assert ok is False and "already declares" in reason
+    assert patch.state(runner) == PatchState.NOT_APPLICABLE
+
+
+def test_lshttpd_pidfile_applicable_on_the_mismatch(tmp_path, monkeypatch):
+    _pidfile_env(tmp_path, monkeypatch, declared="/var/run/lshttpd.pid")
+    patch = LshttpdPidfilePatch()
+    assert patch.applicable(Runner())[0] is True
+
+
+def test_lshttpd_pidfile_stays_applied_after_apply(tmp_path, monkeypatch):
+    # Applying changes only the *effective* value; applicability is judged on the
+    # vendor unit, so the patch must read APPLIED afterwards -- not NOT_APPLICABLE.
+    dropin = _pidfile_env(tmp_path, monkeypatch, declared="/var/run/lshttpd.pid")
+    effective = {"v": "/var/run/lshttpd.pid"}
+    monkeypatch.setattr(lpf, "_effective_pidfile", lambda r: effective["v"])
+
+    patch = LshttpdPidfilePatch()
+    runner = Runner()
+    assert patch.state(runner) == PatchState.NOT_APPLIED
+
+    patch.apply(runner)
+    effective["v"] = "/tmp/lshttpd/lshttpd.pid"        # daemon-reload picked it up
+    assert lpf.MARKER in dropin.read_text()
+    assert "PIDFile=/tmp/lshttpd/lshttpd.pid" in dropin.read_text()
+    assert patch.applicable(runner)[0] is True
+    assert patch.state(runner) == PatchState.APPLIED
+
+    patch.remove(runner)
+    effective["v"] = "/var/run/lshttpd.pid"
+    assert not dropin.exists()
+    assert patch.state(runner) == PatchState.NOT_APPLIED
+
+
+def test_lshttpd_pidfile_dropin_not_present_until_systemd_loads_it(tmp_path, monkeypatch):
+    # A drop-in on disk that daemon-reload has not picked up must not count as
+    # present, otherwise the patch would claim a fix that is not in effect.
+    dropin = _pidfile_env(tmp_path, monkeypatch, declared="/var/run/lshttpd.pid")
+    dropin.write_text(f"# {lpf.MARKER}\n[Service]\nPIDFile=/tmp/lshttpd/lshttpd.pid\n")
+    monkeypatch.setattr(lpf, "_effective_pidfile", lambda r: "/var/run/lshttpd.pid")
+    patch = LshttpdPidfilePatch()
+    assert patch.state(Runner()) == PatchState.NOT_APPLIED

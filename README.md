@@ -61,13 +61,15 @@ It registers a cPanel Standardized Hook on `System::upcp` (post stage) that runs
 
 ## Patches
 
-Five patches ship today — see **[PATCHES.md](PATCHES.md)** for full descriptions,
+Seven patches ship today — see **[PATCHES.md](PATCHES.md)** for full descriptions,
 security notes and a guide to writing your own.
 
 | ID | Fixes |
 |----|-------|
 | `account-startdate` | new accounts recorded with a creation date in the past |
 | `https-redirect-date` | greyed-out **Force HTTPS Redirect** toggle |
+| `lshttpd-pidfile` | `systemctl restart lshttpd` timing out after 90s, unit left failed |
+| `lsws-suspend-reload` | a suspended account whose site keeps serving normally |
 | `mail-sni-sync` | secure IMAP/SMTP presenting the server hostname cert on `mail.<domain>` |
 | `pdns-upcp-removal` | PowerDNS uninstalled by a cPanel update, DNS down |
 | `pg-cpses` | phpPgAdmin *"Authentication failed"* (broken `pam_cpses.so`) |

@@ -3,6 +3,32 @@
 All notable changes to **cPanel Doctor** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] — 2026-08-22
+### Added
+- `lsws-suspend-reload` patch — fixes **suspended accounts whose sites keep being
+  served**. Suspending an account regenerates
+  `/etc/apache2/conf.d/includes/account_suspensions.conf`, but LiteSpeed parses the
+  Apache configuration only at start/restart and watches the parent `httpd.conf`
+  rather than the files it includes, so nothing ever makes it read the new redirect
+  block: WHM reports the account suspended while the site stays online, sometimes for
+  days. Accounts suspended before the running LSWS process started behave correctly,
+  which makes the bug look random. The patch installs a
+  `Whostmgr::Accounts::suspendacct` / `::unsuspendacct` (post) hook that touches
+  `httpd.conf` and reloads LiteSpeed, serialized with an `flock` so bulk suspensions
+  cannot stack overlapping restarts. Its self-test compares the running server's
+  start time against the suspensions file, so a host that is already behind is
+  reported rather than assumed healthy.
+- `lshttpd-pidfile` patch — fixes **`lshttpd.service` declaring a PID file that is
+  never written**. The packaged unit pairs `Type=forking` with
+  `PIDFile=/var/run/lshttpd.pid` while `lswsctrl` writes `/tmp/lshttpd/lshttpd.pid`,
+  so systemd waits for a file nothing creates, times out after `TimeoutStartSec`
+  (90s) and marks the service failed even though LiteSpeed started correctly. The
+  unit then stops tracking the server, so a later start can spawn a second instance;
+  both bind the same sockets via `SO_REUSEPORT` with different configurations and the
+  same URL begins answering inconsistently. A systemd drop-in supplies the real path
+  (read out of `lswsctrl` itself), cutting restart time from ~91s to a few seconds
+  and leaving the vendor unit untouched.
+
 ## [0.4.0] — 2026-07-28
 ### Added
 - `mail-sni-sync` patch — fixes **mail services presenting the server hostname
