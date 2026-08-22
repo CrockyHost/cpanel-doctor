@@ -1,6 +1,8 @@
 """Patch-system sanity tests (no root / no live cPanel required)."""
 from __future__ import annotations
 
+import os
+
 from cpanel_doctor.core import Action, Patch, PatchState, Runner, load_patches, patches_by_id
 from cpanel_doctor.patches import account_startdate as asd
 from cpanel_doctor.patches import https_redirect_date as hrd
@@ -342,11 +344,13 @@ def test_mail_sni_not_applicable_off_cpanel(tmp_path, monkeypatch):
     assert patch.state(runner) == PatchState.NOT_APPLICABLE
 
 
-def _sni_env(tmp_path, monkeypatch, userdata: str, sni: str, ca_domains):
+def _sni_env(tmp_path, monkeypatch, userdata: str, sni: str, ca_domains, covers=None):
     """A fake cPanel mail-SNI environment with tunable inputs.
 
-    ``ca_domains`` is the set of domains whose apache_tls ``combined`` is treated
+    ``ca_domains`` is the set of vhosts whose apache_tls ``combined`` is treated
     as a real (CA-issued) certificate; anything else is considered self-signed.
+    ``covers`` maps a vhost to extra names its certificate is valid for, which is
+    how a parked domain rides on the main domain's SAN list.
     """
     build = tmp_path / "build_mail_sni"
     build.write_text("#!/bin/sh\n")
@@ -357,19 +361,30 @@ def _sni_env(tmp_path, monkeypatch, userdata: str, sni: str, ca_domains):
     userdata_file = tmp_path / "userdatadomains"
     userdata_file.write_text(userdata)
     apache_tls = tmp_path / "apache_tls"
-    # Give every domain that appears in userdata a placeholder combined file so the
-    # CA-vs-self-signed decision is driven purely by the monkeypatched checker.
+    # Certificates are filed per *vhost*, not per domain -- a parked/addon domain
+    # has no directory of its own. Mirroring that is the whole point here.
     for line in userdata.splitlines():
-        dom = line.split(":", 1)[0].strip()
-        if dom:
-            (apache_tls / dom).mkdir(parents=True, exist_ok=True)
-            (apache_tls / dom / "combined").write_text("cert")
+        rest = line.split(":", 1)[1] if ":" in line else ""
+        fields = [f.strip().lower() for f in rest.split("==")]
+        dtype = next((f for f in fields if f in {"main", "addon", "parked", "sub"}), "")
+        if not dtype:
+            continue
+        vhost = fields[fields.index(dtype) + 1]
+        (apache_tls / vhost).mkdir(parents=True, exist_ok=True)
+        (apache_tls / vhost / "combined").write_text("cert")
+
+    covers = covers or {}
+
+    def _names(r, path):
+        vhost = os.path.basename(os.path.dirname(path))
+        return {vhost, f"*.{vhost}"} | set(covers.get(vhost, ()))
 
     monkeypatch.setattr(mss, "BUILD_MAIL_SNI", str(build))
     monkeypatch.setattr(mss, "SNI_CONF", str(sni_conf))
     monkeypatch.setattr(mss, "USERDATADOMAINS", str(userdata_file))
     monkeypatch.setattr(mss, "APACHE_TLS_DIR", str(apache_tls))
     monkeypatch.setattr(mss, "_is_ca_signed", lambda r, path: any(f"/{d}/" in path for d in ca_domains))
+    monkeypatch.setattr(mss, "_cert_names", _names)
 
 
 # A realistic slice: two mail-bearing main domains, a web-only sub, and a
@@ -814,3 +829,58 @@ def test_lsws_ssl_pidfile_read_from_lswsctrl(tmp_path, monkeypatch):
     ctrl.write_text("#!/bin/sh\nPIDFILE=/tmp/lshttpd/lshttpd.pid\n")
     monkeypatch.setattr(lsl, "LSWSCTRL", str(ctrl))
     assert lsl._lsws_pidfile(Runner()) == "/tmp/lshttpd/lshttpd.pid"
+
+
+# A parked domain: no apache_tls directory of its own, served by the account's
+# main-domain certificate whose SAN list covers it. Looking the certificate up by
+# domain skipped these entirely -- the case that left mail.oxidev.ro handing out
+# the server hostname certificate while the patch reported nothing wrong.
+_PARKED_USERDATA = (
+    "oxidev-systems.ro: oxidevsy==root==main==oxidev-systems.ro==/home/oxidevsy/public_html==1.2.3.4\n"
+    "oxidev.ro: oxidevsy==root==parked==oxidev-systems.ro==/home/oxidevsy/public_html==1.2.3.4\n"
+)
+_SNI_ONLY_MAIN = 'local_name "oxidev-systems.ro" {\n  ssl_server_cert_file = /x\n}\n'
+
+
+def test_mail_sni_candidate_domains_map_to_their_vhost(tmp_path, monkeypatch):
+    userdata = tmp_path / "userdatadomains"
+    userdata.write_text(_PARKED_USERDATA)
+    monkeypatch.setattr(mss, "USERDATADOMAINS", str(userdata))
+    assert mss._sni_candidate_domains(Runner()) == {
+        "oxidev-systems.ro": "oxidev-systems.ro",
+        "oxidev.ro": "oxidev-systems.ro",     # parked -> the cert-bearing vhost
+    }
+
+
+def test_mail_sni_detects_parked_domain_on_main_domain_cert(tmp_path, monkeypatch):
+    # The regression: oxidev.ro is parked, has no apache_tls dir, and is covered by
+    # the oxidev-systems.ro certificate's SAN list. It must be reported as missing.
+    _sni_env(
+        tmp_path, monkeypatch, _PARKED_USERDATA, _SNI_ONLY_MAIN,
+        ca_domains={"oxidev-systems.ro"},
+        covers={"oxidev-systems.ro": {"oxidev.ro", "*.oxidev.ro"}},
+    )
+    runner = Runner()
+    assert mss._domains_missing_from_sni(runner) == ["oxidev.ro"]
+    ok, msg = MailSniSyncPatch().self_test(runner)
+    assert ok is False and "oxidev.ro" in msg
+
+
+def test_mail_sni_ignores_domain_the_vhost_cert_does_not_cover(tmp_path, monkeypatch):
+    # Same shape, but the certificate does not name the parked domain. Wiring it
+    # into SNI would hand out a cert that fails hostname verification anyway, so
+    # it must not be reported -- the fix is a new certificate, not a rebuild.
+    _sni_env(
+        tmp_path, monkeypatch, _PARKED_USERDATA, _SNI_ONLY_MAIN,
+        ca_domains={"oxidev-systems.ro"},
+        covers={},           # cert covers only oxidev-systems.ro
+    )
+    assert mss._domains_missing_from_sni(Runner()) == []
+
+
+def test_mail_sni_name_covered_matches_one_level_wildcard():
+    names = {"example.com", "*.example.com"}
+    assert mss._name_covered("example.com", names)
+    assert mss._name_covered("mail.example.com", names)
+    assert not mss._name_covered("a.b.example.com", names)   # wildcard is one level
+    assert not mss._name_covered("other.com", names)

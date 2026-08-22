@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import List, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 from ..core import Component, Patch, Runner, RunnerError
 
@@ -97,21 +97,32 @@ def _covered_by_sni(domain: str, localnames: Set[str]) -> bool:
     return bool(parent) and f"*.{parent}" in localnames
 
 
-def _sni_candidate_domains(r: Runner) -> Set[str]:
-    """Domains cPanel would give a mail-SNI entry: main/addon/parked from
-    ``/etc/userdatadomains`` (user-created ``sub`` domains are excluded)."""
+def _sni_candidate_domains(r: Runner) -> Dict[str, str]:
+    """Map each mail-SNI candidate domain to the vhost whose certificate serves it.
+
+    Candidates are the main/addon/parked entries of ``/etc/userdatadomains``
+    (user-created ``sub`` domains are excluded). The value is the account's main
+    domain, because that is the name cPanel files the certificate under: a parked
+    domain like ``oxidev.ro`` has no ``apache_tls/oxidev.ro`` of its own and is
+    served by ``apache_tls/oxidev-systems.ro``, whose SAN list covers it.
+    """
     text = r.read(USERDATADOMAINS) or ""
-    doms: Set[str] = set()
+    doms: Dict[str, str] = {}
     for line in text.splitlines():
         domain, sep, rest = line.partition(":")
         if not sep:
             continue
         # Fields are '=='-separated (user==owner==type==maindomain==docroot==...).
         # Find the type token by value so we don't depend on its exact position.
-        fields = [f.strip().lower() for f in rest.split("==")]
+        raw = [f.strip() for f in rest.split("==")]
+        fields = [f.lower() for f in raw]
         dtype = next((f for f in fields if f in {"main", "addon", "parked", "sub"}), "")
-        if dtype in _MAIL_SNI_TYPES:
-            doms.add(domain.strip().lower())
+        if dtype not in _MAIL_SNI_TYPES:
+            continue
+        idx = fields.index(dtype)
+        vhost = fields[idx + 1] if idx + 1 < len(fields) else ""
+        name = domain.strip().lower()
+        doms[name] = vhost or name
     return doms
 
 
@@ -133,18 +144,43 @@ def _is_ca_signed(r: Runner, cert_path: str) -> bool:
     return bool(issuer) and bool(subject) and issuer != subject
 
 
+def _cert_names(r: Runner, cert_path: str) -> Set[str]:
+    """Every DNS name the certificate is valid for (CN plus subjectAltName)."""
+    try:
+        res = r.capture(["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName"])
+    except (OSError, ValueError):
+        return set()
+    return {m.strip().lower() for m in re.findall(r"DNS:([^,\s]+)", res.stdout or "")}
+
+
+def _name_covered(domain: str, names: Set[str]) -> bool:
+    """Whether ``domain`` is covered exactly or by a one-level wildcard."""
+    if domain in names:
+        return True
+    parent = domain.split(".", 1)[1] if "." in domain else ""
+    return bool(parent) and f"*.{parent}" in names
+
+
 def _domains_missing_from_sni(r: Runner) -> List[str]:
     """main/addon/parked domains that own a real (CA) web cert but present the
     wrong certificate on the mail ports because they are absent from mail SNI."""
     localnames = _sni_localnames(r)
     missing: List[str] = []
-    for domain in sorted(_sni_candidate_domains(r)):
+    for domain, vhost in sorted(_sni_candidate_domains(r).items()):
         if _covered_by_sni(domain, localnames):
             continue  # already presents its own cert on the mail ports
-        combined = os.path.join(APACHE_TLS_DIR, domain, "combined")
+        # The certificate is filed under the vhost, not the domain: a parked or
+        # addon domain has no apache_tls directory of its own. Looking it up by
+        # domain silently skipped exactly those, so a parked domain could sit on
+        # the wrong mail certificate while this reported everything in order.
+        combined = os.path.join(APACHE_TLS_DIR, vhost, "combined")
         # Only a CA-issued web cert *should* have a mail SNI entry; a self-signed
         # placeholder legitimately does not, so it is not counted as drift.
-        if r.exists(combined) and _is_ca_signed(r, combined):
+        if not (r.exists(combined) and _is_ca_signed(r, combined)):
+            continue
+        # ...and it must actually be valid for this name, or wiring it into SNI
+        # would hand out a certificate that fails hostname verification anyway.
+        if _name_covered(domain, _cert_names(r, combined)):
             missing.append(domain)
     return missing
 

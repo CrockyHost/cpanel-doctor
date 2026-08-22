@@ -3,6 +3,22 @@
 All notable changes to **cPanel Doctor** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.1] — 2026-08-22
+### Fixed
+- `mail-sni-sync` no longer misses **parked and addon domains** — the case it is
+  most likely to be needed for. It looked the certificate up at
+  `apache_tls/<domain>/combined`, but cPanel files certificates under the *vhost*:
+  a parked domain such as `oxidev.ro` has no directory of its own and is served by
+  `apache_tls/oxidev-systems.ro`, whose SAN list covers it. The lookup missed, the
+  domain was skipped silently, and the patch reported everything in order while
+  `mail.oxidev.ro` handed out the server's hostname certificate. Outlook aborted
+  the IMAP handshake with TLS alert 42 (`bad_certificate`) before any password was
+  tried, and reported it to the user as a missing app password.
+  Candidate domains are now mapped to their vhost, and the vhost certificate must
+  actually name the domain (exact match or one-level wildcard) before it is
+  reported — a domain the certificate does not cover needs a new certificate, not
+  an SNI rebuild, so it is deliberately left unflagged.
+
 ## [0.6.0] — 2026-08-22
 ### Added
 - `lsws-ssl-reload` patch — fixes **a newly issued certificate that is never
