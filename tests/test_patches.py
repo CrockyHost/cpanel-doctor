@@ -8,12 +8,14 @@ from cpanel_doctor.patches import pdns_upcp_removal as puc
 from cpanel_doctor.patches import mail_sni_sync as mss
 from cpanel_doctor.patches import lshttpd_pidfile as lpf
 from cpanel_doctor.patches import lsws_suspend_reload as lsr
+from cpanel_doctor.patches import lsws_ssl_reload as lsl
 from cpanel_doctor.patches.account_startdate import AccountStartdatePatch
 from cpanel_doctor.patches.https_redirect_date import HttpsRedirectDatePatch
 from cpanel_doctor.patches.pdns_upcp_removal import PdnsUpcpRemovalPatch
 from cpanel_doctor.patches.mail_sni_sync import MailSniSyncPatch
 from cpanel_doctor.patches.lshttpd_pidfile import LshttpdPidfilePatch
 from cpanel_doctor.patches.lsws_suspend_reload import LswsSuspendReloadPatch
+from cpanel_doctor.patches.lsws_ssl_reload import LswsSslReloadPatch
 from cpanel_doctor.patches.pg_cpses import PgCpsesPatch
 
 
@@ -29,6 +31,7 @@ def test_patches_discovered():
     assert "mail-sni-sync" in registry
     assert "lsws-suspend-reload" in registry
     assert "lshttpd-pidfile" in registry
+    assert "lsws-ssl-reload" in registry
 
 
 def test_pg_cpses_components_well_formed():
@@ -651,3 +654,163 @@ def test_lshttpd_pidfile_dropin_not_present_until_systemd_loads_it(tmp_path, mon
     monkeypatch.setattr(lpf, "_effective_pidfile", lambda r: "/var/run/lshttpd.pid")
     patch = LshttpdPidfilePatch()
     assert patch.state(Runner()) == PatchState.NOT_APPLIED
+
+
+# --------------------------------------------------------------------------- #
+# lsws-ssl-reload: a new certificate must actually be served
+# --------------------------------------------------------------------------- #
+
+# A realistic `manage_hooks list` slice: our script under both SSL events, plus a
+# neighbouring event so the parser cannot simply match on the path alone.
+_SSL_HOOK_LISTING = """Whostmgr:
+	AutoSSL::installssl:
+		weight: 100
+		hook: /usr/local/cpanel/3rdparty/wp-toolkit/bin/handle-event
+		stage: post
+		--
+		weight: 900
+		hook: /usr/local/cpanel/scripts/cpanel_doctor_lsws_ssl_reload.sh
+		stage: post
+	SSL::installssl:
+		weight: 900
+		hook: /usr/local/cpanel/scripts/cpanel_doctor_lsws_ssl_reload.sh
+		stage: post
+	Accounts::suspendacct:
+		weight: 900
+		hook: /usr/local/cpanel/scripts/cpanel_doctor_lsws_suspend_reload.sh
+		stage: post
+"""
+
+
+def test_lsws_ssl_components_well_formed():
+    patch = LswsSslReloadPatch()
+    comps = patch.components()
+    assert [c.key for c in comps] == ["hook_script", "hook_autossl", "hook_manual"]
+    for c in comps:
+        assert callable(c.present) and callable(c.apply) and callable(c.remove)
+
+
+def test_lsws_ssl_hook_listing_parser():
+    # Both SSL events must be recognised for our script, and the neighbouring
+    # suspend hook must not be attributed to it.
+    events = lsl._parse_registered_events(_SSL_HOOK_LISTING, lsl.HOOK_PATH)
+    assert events == {"AutoSSL::installssl", "SSL::installssl"}
+    other = lsl._parse_registered_events(
+        _SSL_HOOK_LISTING, "/usr/local/cpanel/scripts/cpanel_doctor_lsws_suspend_reload.sh"
+    )
+    assert other == {"Accounts::suspendacct"}
+    assert lsl._parse_registered_events(_SSL_HOOK_LISTING, "/nope") == set()
+
+
+def test_lsws_ssl_not_applicable_without_litespeed(tmp_path, monkeypatch):
+    # On an Apache host the cert is picked up by cPanel's own reload, nothing to fix.
+    hooks = tmp_path / "manage_hooks"
+    hooks.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(lsl, "MANAGE_HOOKS", str(hooks))
+    monkeypatch.setattr(lsl, "LSWSCTRL", str(tmp_path / "nope"))
+    patch = LswsSslReloadPatch()
+    runner = Runner()
+    ok, reason = patch.applicable(runner)
+    assert ok is False and "LiteSpeed" in reason
+    assert patch.state(runner) == PatchState.NOT_APPLICABLE
+
+
+def test_lsws_ssl_not_applicable_off_cpanel(tmp_path, monkeypatch):
+    monkeypatch.setattr(lsl, "MANAGE_HOOKS", str(tmp_path / "nope"))
+    patch = LswsSslReloadPatch()
+    assert patch.applicable(Runner())[0] is False
+
+
+def test_lsws_ssl_script_roundtrip(tmp_path, monkeypatch):
+    # The managed script is written with its marker and removed cleanly.
+    script = tmp_path / "reload.sh"
+    monkeypatch.setattr(lsl, "HOOK_PATH", str(script))
+
+    patch = LswsSslReloadPatch()
+    runner = Runner()
+    comp = {c.key: c for c in patch.components()}["hook_script"]
+
+    assert comp.present(runner) is False
+    comp.apply(runner)
+    assert comp.present(runner) is True
+    body = script.read_text()
+    assert lsl.MARKER in body
+    assert "MODE=graceful" in body          # zero-downtime default
+    # An AutoSSL run fires per vhost: the burst must coalesce into one restart,
+    # which is what the non-blocking lock plus the debounce sleep achieve.
+    assert "flock -n" in body
+    assert "DEBOUNCE=" in body
+    comp.remove(runner)
+    assert comp.present(runner) is False
+
+
+def test_lsws_ssl_dry_run_registers_both_events(tmp_path, monkeypatch):
+    # A dry-run apply must plan the script plus BOTH hook registrations, and
+    # touch nothing on disk.
+    script = tmp_path / "reload.sh"
+    hooks = tmp_path / "manage_hooks"
+    hooks.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(lsl, "HOOK_PATH", str(script))
+    monkeypatch.setattr(lsl, "MANAGE_HOOKS", str(hooks))
+    monkeypatch.setattr(lsl, "_registered_events", lambda r, p: set())
+
+    patch = LswsSslReloadPatch()
+    runner = Runner(dry_run=True)
+    patch.apply(runner)
+
+    ran = [a.target for a in runner.actions if a.kind == "run"]
+    assert any("AutoSSL::installssl" in t for t in ran)
+    assert any("SSL::installssl" in t for t in ran)
+    assert not script.exists()
+
+
+def test_lsws_ssl_detects_server_older_than_newest_cert(tmp_path, monkeypatch):
+    # The signature of the bug: LiteSpeed started before the certificate was
+    # installed, so that vhost is still answered with the hostname certificate.
+    tls = tmp_path / "apache_tls"
+    (tls / "example.com").mkdir(parents=True)
+    combined = tls / "example.com" / "combined"
+    combined.write_text("-----BEGIN CERTIFICATE-----\n")
+    monkeypatch.setattr(lsl, "APACHE_TLS_DIR", str(tls))
+    runner = Runner()
+
+    mtime = combined.stat().st_mtime
+    monkeypatch.setattr(lsl, "_lsws_start_epoch", lambda r: int(mtime) - 3600)
+    assert lsl._stale_certs(runner) == (True, "example.com")   # server older -> stale
+    monkeypatch.setattr(lsl, "_lsws_start_epoch", lambda r: int(mtime) + 3600)
+    assert lsl._stale_certs(runner)[0] is False                # restarted since -> current
+    monkeypatch.setattr(lsl, "_lsws_start_epoch", lambda r: None)
+    assert lsl._stale_certs(runner)[0] is None                 # undeterminable, never crash
+
+
+def test_lsws_ssl_newest_cert_picks_the_latest(tmp_path, monkeypatch):
+    # With many vhosts only the most recently installed certificate matters --
+    # that is the one the running server may not have read yet.
+    import os
+
+    tls = tmp_path / "apache_tls"
+    for name in ("old.example", "new.example"):
+        (tls / name).mkdir(parents=True)
+        (tls / name / "combined").write_text("cert\n")
+    os.utime(tls / "old.example" / "combined", (1000, 1000))
+    os.utime(tls / "new.example" / "combined", (99000, 99000))
+    # A directory with no certificate in it must be skipped, not crash.
+    (tls / "pending.example").mkdir()
+    monkeypatch.setattr(lsl, "APACHE_TLS_DIR", str(tls))
+
+    mtime, domain = lsl._newest_cert(Runner())
+    assert domain == "new.example" and mtime == 99000
+
+
+def test_lsws_ssl_newest_cert_missing_dir_is_not_fatal(tmp_path, monkeypatch):
+    # A host that has never installed a certificate has no apache_tls directory.
+    monkeypatch.setattr(lsl, "APACHE_TLS_DIR", str(tmp_path / "nope"))
+    assert lsl._newest_cert(Runner()) == (None, "")
+
+
+def test_lsws_ssl_pidfile_read_from_lswsctrl(tmp_path, monkeypatch):
+    # The PID path must be read from lswsctrl, not assumed to be /var/run.
+    ctrl = tmp_path / "lswsctrl"
+    ctrl.write_text("#!/bin/sh\nPIDFILE=/tmp/lshttpd/lshttpd.pid\n")
+    monkeypatch.setattr(lsl, "LSWSCTRL", str(ctrl))
+    assert lsl._lsws_pidfile(Runner()) == "/tmp/lshttpd/lshttpd.pid"

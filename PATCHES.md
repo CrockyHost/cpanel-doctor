@@ -10,6 +10,7 @@ detection, idempotent apply, surgical re-apply and clean removal all come for fr
 | [`account-startdate`](#account-startdate--new-accounts-get-a-past-creation-date) | new accounts recorded with a creation date in the past |
 | [`https-redirect-date`](#https-redirect-date--force-https-redirect-greyed-out) | greyed-out **Force HTTPS Redirect** toggle |
 | [`lshttpd-pidfile`](#lshttpd-pidfile--litespeed-systemd-unit-points-at-the-wrong-pid-file) | `systemctl restart lshttpd` timing out after 90s and leaving the unit failed |
+| [`lsws-ssl-reload`](#lsws-ssl-reload--new-certificates-are-not-served-until-litespeed-restarts) | a newly issued certificate not served, the domain answered with the server hostname's cert |
 | [`lsws-suspend-reload`](#lsws-suspend-reload--suspended-accounts-still-served-by-litespeed) | a suspended account whose site keeps serving normally |
 | [`mail-sni-sync`](#mail-sni-sync--mail-ports-present-the-wrong-hostname-certificate) | secure IMAP/SMTP presenting the server hostname cert on `mail.<domain>` |
 | [`pdns-upcp-removal`](#pdns-upcp-removal--powerdns-uninstalled-by-a-cpanel-update) | PowerDNS uninstalled by a cPanel update, DNS down |
@@ -77,6 +78,60 @@ being applied instead of flipping to NOT-APPLICABLE.
 `Type=forking` cannot follow, so systemd can still drift out of sync after a
 self-triggered reload; re-sync with
 `systemctl reset-failed lshttpd && systemctl start lshttpd`.
+
+## `lsws-ssl-reload` — new certificates are not served until LiteSpeed restarts
+Installing a certificate — by hand in WHM, or automatically at the end of an
+AutoSSL run — does everything right on the cPanel side: the certificate lands in
+`/var/cpanel/ssl/apache_tls/<domain>/` and `/etc/apache2/conf/httpd.conf` is
+regenerated with the matching `<VirtualHost ...:443>` block. **Nothing restarts the
+web server.**
+
+LiteSpeed reads the Apache configuration, and the certificates it points at, only
+at start/restart. A server process older than the certificate keeps serving the
+previous one — and a vhost that had *no* certificate before is not in the running
+configuration at all, so the connection falls through to the default listener and
+is answered with the **server hostname's** certificate:
+
+```
+$ openssl s_client -connect <ip>:443 -servername newsite.example
+subject=CN = cpcalendars.<server-hostname>
+```
+
+Browsers reject that outright; if the hostname certificate is itself expired the
+error becomes a confusing mix of "wrong name" and "expired". The signature is a
+LiteSpeed process older than the certificate:
+
+```
+# ps -o lstart= -p $(cat /tmp/lshttpd/lshttpd.pid)   # Sat Aug 22 19:10:20
+# stat -c %y /var/cpanel/ssl/apache_tls/newsite.example/combined
+                                                     2026-08-22 19:27:24
+```
+
+Certificates installed *before* that process started are served correctly, so
+domains secured weeks apart behave differently and the fault looks intermittent.
+
+The patch installs `Whostmgr::AutoSSL::installssl` / `Whostmgr::SSL::installssl`
+(post) hooks that touch `httpd.conf` and reload LiteSpeed. Components:
+`hook_script`, `hook_autossl`, `hook_manual` — one per registration, so losing a
+single event reads as DRIFTED and is healed by `reapply`. The self-test compares
+the running server's start time against the newest certificate under
+`apache_tls/`, naming the domain that is still being served the wrong one.
+
+**Coalescing.** AutoSSL fires its event once *per vhost*, so a naive hook would
+ask for one restart per domain on every run. The installed script takes its lock
+**non-blockingly** and exits when another invocation already holds it; that holder
+sleeps `DEBOUNCE` (20s) before reloading, absorbing the rest of the burst while
+still reloading after the last certificate was written. A full AutoSSL run
+collapses into a single restart. The worker is detached, so the hook never delays
+the AutoSSL run or the WHM API response.
+
+**Caveat:** defaults to `MODE=graceful` — no downtime, but the outgoing instance
+drains with the old certificate, so a new one is fully live after about a minute.
+`MODE=full` makes the switch immediate via `systemctl restart lshttpd` at the cost
+of a few seconds of downtime for **every** site per install; apply
+[`lshttpd-pidfile`](#lshttpd-pidfile--litespeed-systemd-unit-points-at-the-wrong-pid-file)
+first or that restart blocks for 90s. Either mode still waits out `DEBOUNCE`, so a
+certificate goes live seconds after issuance rather than the same instant.
 
 ## `lsws-suspend-reload` — suspended accounts still served by LiteSpeed
 Suspending an account does everything right on the cPanel side — it writes

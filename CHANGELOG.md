@@ -3,6 +3,29 @@
 All notable changes to **cPanel Doctor** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.0] — 2026-08-22
+### Added
+- `lsws-ssl-reload` patch — fixes **a newly issued certificate that is never
+  served**. Installing a certificate, by hand in WHM or at the end of an AutoSSL
+  run, writes it under `/var/cpanel/ssl/apache_tls/<domain>/` and regenerates
+  `httpd.conf`, but nothing restarts the web server. LiteSpeed reads the Apache
+  configuration and its certificates only at start/restart, so a server older than
+  the certificate keeps serving the previous one — and a vhost that had no
+  certificate at all is missing from the running configuration entirely, falls
+  through to the default listener and is answered with the **server hostname's**
+  certificate, i.e. a freshly secured domain presents `cpanel.<hostname>` or
+  another SAN of it and every browser rejects it. Certificates installed before the
+  running process started work fine, which makes the fault look intermittent. The
+  patch installs `Whostmgr::AutoSSL::installssl` / `Whostmgr::SSL::installssl`
+  (post) hooks that touch `httpd.conf` and reload LiteSpeed. Because AutoSSL fires
+  once per vhost, the script coalesces a run into a single restart: it takes its
+  lock non-blockingly and exits when another invocation holds it, while that holder
+  waits `DEBOUNCE` (20s) before reloading, so the one reload still lands after the
+  last certificate was written. The worker is detached, so the hook never delays
+  the AutoSSL run or the WHM API response. Its self-test compares the running
+  server's start time against the newest certificate under `apache_tls/` and names
+  the domain still being served the wrong one.
+
 ## [0.5.0] — 2026-08-22
 ### Added
 - `lsws-suspend-reload` patch — fixes **suspended accounts whose sites keep being
