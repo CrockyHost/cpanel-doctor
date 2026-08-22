@@ -29,6 +29,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   (read out of `lswsctrl` itself), cutting restart time from ~91s to a few seconds
   and leaving the vendor unit untouched.
 
+### Fixed
+- `cpanel-doctor --version` reported a build that was no longer installed. The
+  version literal in `cpanel_doctor/__init__.py` was maintained by hand and had
+  silently drifted two releases behind; it is now read from the installed
+  distribution, with `pyproject.toml` as the single source of truth.
+- CI is reproducible again across linter upgrades. The workflow installs `ruff`
+  unpinned and the project selected no rules, so it inherited ruff's defaults —
+  ruff 0.16 folded pyupgrade (UP) into those and 68 errors appeared across files
+  nobody had touched. The enforced rule set is now declared in `pyproject.toml`.
+  A patch test also drove `apply()` through a real `Runner` and actually ran
+  `systemctl daemon-reload`, passing only where it happened to have root.
+
 ## [0.4.0] — 2026-07-28
 ### Added
 - `mail-sni-sync` patch — fixes **mail services presenting the server hostname
