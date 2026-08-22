@@ -1,7 +1,7 @@
 """Patch-system sanity tests (no root / no live cPanel required)."""
 from __future__ import annotations
 
-from cpanel_doctor.core import Patch, PatchState, Runner, load_patches, patches_by_id
+from cpanel_doctor.core import Action, Patch, PatchState, Runner, load_patches, patches_by_id
 from cpanel_doctor.patches import account_startdate as asd
 from cpanel_doctor.patches import https_redirect_date as hrd
 from cpanel_doctor.patches import pdns_upcp_removal as puc
@@ -602,12 +602,27 @@ def test_lshttpd_pidfile_applicable_on_the_mismatch(tmp_path, monkeypatch):
     assert patch.applicable(Runner())[0] is True
 
 
+def _stub_run(monkeypatch):
+    """Record commands instead of executing them.
+
+    apply()/remove() here really would run `systemctl daemon-reload`, which works
+    for root but fails with "Interactive authentication required" on an
+    unprivileged CI runner -- a test must not depend on the privileges it happens
+    to have.
+    """
+    monkeypatch.setattr(
+        Runner, "run",
+        lambda self, cmd, timeout=120, check=True: self._record(Action("run", " ".join(cmd))),
+    )
+
+
 def test_lshttpd_pidfile_stays_applied_after_apply(tmp_path, monkeypatch):
     # Applying changes only the *effective* value; applicability is judged on the
     # vendor unit, so the patch must read APPLIED afterwards -- not NOT_APPLICABLE.
     dropin = _pidfile_env(tmp_path, monkeypatch, declared="/var/run/lshttpd.pid")
     effective = {"v": "/var/run/lshttpd.pid"}
     monkeypatch.setattr(lpf, "_effective_pidfile", lambda r: effective["v"])
+    _stub_run(monkeypatch)
 
     patch = LshttpdPidfilePatch()
     runner = Runner()
@@ -617,6 +632,8 @@ def test_lshttpd_pidfile_stays_applied_after_apply(tmp_path, monkeypatch):
     effective["v"] = "/tmp/lshttpd/lshttpd.pid"        # daemon-reload picked it up
     assert lpf.MARKER in dropin.read_text()
     assert "PIDFile=/tmp/lshttpd/lshttpd.pid" in dropin.read_text()
+    # A drop-in is inert until systemd re-reads it, so apply must ask for that.
+    assert any(a.kind == "run" and "daemon-reload" in a.target for a in runner.actions)
     assert patch.applicable(runner)[0] is True
     assert patch.state(runner) == PatchState.APPLIED
 

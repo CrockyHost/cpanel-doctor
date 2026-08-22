@@ -45,3 +45,12 @@ include = ["src/cpanel_doctor", "README.md", "LICENSE", "PATCHES.md", "CHANGELOG
 [tool.ruff]
 line-length = 100
 target-version = "py38"
+
+[tool.ruff.lint]
+# Select the rule set explicitly instead of inheriting ruff's defaults. Those
+# defaults are not stable across releases -- ruff 0.16 folded pyupgrade (UP)
+# into them, which turned CI red overnight without a line of code changing,
+# because the workflow installs ruff unpinned. Naming the rules the project
+# actually enforces keeps `ruff check` reproducible across linter upgrades;
+# adopting a new rule family becomes a deliberate edit here.
+select = ["E4", "E7", "E9", "F"]
