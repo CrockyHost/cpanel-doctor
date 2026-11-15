@@ -192,11 +192,15 @@ ports (993 / 995 / 465 / 587) with a name-mismatch error and fall back to plaint
 or fail to connect. The services themselves are fine — only the certificate handed
 out for the domain is wrong.
 
-Single component `sni_synced`: reports **present** only while every cPanel-managed
-**main/addon/parked** domain that owns a *CA-issued* web certificate also appears in
-`/etc/dovecot/sni.conf`. Web-only subdomains (type `sub`) and self-signed
-placeholders are excluded — cPanel deliberately gives those no mail SNI, so a
-healthy host reads cleanly **APPLIED**. Healing runs
+Single component `sni_synced`: reports **present** only while every domain cPanel
+itself would give mail SNI, and that owns a *CA-issued* web certificate naming it,
+also appears in `/etc/dovecot/sni.conf`. The rule mirrors cPanel's own builder
+(`Cpanel::AdvConfig::dovecotSNI`): an account's **main** domain always qualifies,
+an **addon/parked** domain only while it has at least one email account
+(`~<user>/etc/<domain>/passwd`). Web-only subdomains (type `sub`), mailbox-less
+addons and self-signed placeholders are excluded. cPanel deliberately gives those
+no mail SNI, and `build_mail_sni` can never add them, so a healthy host reads
+cleanly **APPLIED** instead of failing its heal on every post-upcp run. Healing runs
 `build_mail_sni --rebuild_dovecot_sni_conf --restartsrvs`, which regenerates the
 SNI include and restarts Dovecot/Exim. Applying enrolls the patch, so the
 post-upcp hook's `reapply` re-syncs mail SNI after an update or a certificate

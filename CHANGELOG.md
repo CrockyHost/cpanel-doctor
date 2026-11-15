@@ -3,6 +3,22 @@
 All notable changes to **cPanel Doctor** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.2] — 2026-11-15
+### Fixed
+- `mail-sni-sync` was stuck **NOT APPLIED** and restarted Dovecot/Exim every night
+  for nothing. It flagged any addon/parked domain with a CA certificate that was
+  absent from `/etc/dovecot/sni.conf`, but cPanel's own SNI builder
+  (`Cpanel::AdvConfig::dovecotSNI`) only wires an addon/parked domain into mail SNI
+  while it has **at least one email account**. An addon with no mailboxes
+  (`iuliascs.ro` here) is left out on purpose, so `build_mail_sni` could never add
+  it: every post-upcp `reapply` since 2026-10-14 rebuilt SNI, restarted the mail
+  services, and failed with *"build_mail_sni ran but these domains are still
+  missing from mail SNI"*. The 0.6.1 vhost lookup is what made these domains
+  visible to the check in the first place.
+  Eligibility now mirrors cPanel: an account's main domain always counts, an
+  addon/parked domain only while `~<user>/etc/<domain>/passwd` lists a mailbox.
+  An addon that gains its first mailbox and is still missing is still reported.
+
 ## [0.6.1] — 2026-08-22
 ### Fixed
 - `mail-sni-sync` no longer misses **parked and addon domains** — the case it is

@@ -344,14 +344,19 @@ def test_mail_sni_not_applicable_off_cpanel(tmp_path, monkeypatch):
     assert patch.state(runner) == PatchState.NOT_APPLICABLE
 
 
-def _sni_env(tmp_path, monkeypatch, userdata: str, sni: str, ca_domains, covers=None):
+def _sni_env(tmp_path, monkeypatch, userdata: str, sni: str, ca_domains, covers=None,
+             mailboxes=()):
     """A fake cPanel mail-SNI environment with tunable inputs.
 
     ``ca_domains`` is the set of vhosts whose apache_tls ``combined`` is treated
     as a real (CA-issued) certificate; anything else is considered self-signed.
     ``covers`` maps a vhost to extra names its certificate is valid for, which is
-    how a parked domain rides on the main domain's SAN list.
+    how a parked domain rides on the main domain's SAN list. ``mailboxes`` is
+    the set of domains given one email account (``~user/etc/<domain>/passwd``);
+    cPanel only wires an addon/parked domain into mail SNI when it has one.
     """
+    home = tmp_path / "home"
+    monkeypatch.setattr(mss, "_user_home", lambda user: str(home / user))
     build = tmp_path / "build_mail_sni"
     build.write_text("#!/bin/sh\n")
     dovecot = tmp_path / "dovecot"
@@ -372,6 +377,11 @@ def _sni_env(tmp_path, monkeypatch, userdata: str, sni: str, ca_domains, covers=
         vhost = fields[fields.index(dtype) + 1]
         (apache_tls / vhost).mkdir(parents=True, exist_ok=True)
         (apache_tls / vhost / "combined").write_text("cert")
+        domain = line.split(":", 1)[0].strip().lower()
+        if domain in mailboxes:
+            etc = home / fields[0] / "etc" / domain
+            etc.mkdir(parents=True, exist_ok=True)
+            (etc / "passwd").write_text(f"info:$6$hash:1000:1000::/home/{fields[0]}/mail/{domain}/info:/bin/false\n")
 
     covers = covers or {}
 
@@ -847,8 +857,9 @@ def test_mail_sni_candidate_domains_map_to_their_vhost(tmp_path, monkeypatch):
     userdata.write_text(_PARKED_USERDATA)
     monkeypatch.setattr(mss, "USERDATADOMAINS", str(userdata))
     assert mss._sni_candidate_domains(Runner()) == {
-        "oxidev-systems.ro": "oxidev-systems.ro",
-        "oxidev.ro": "oxidev-systems.ro",     # parked -> the cert-bearing vhost
+        "oxidev-systems.ro": mss._Candidate("oxidev-systems.ro", "oxidevsy", "main"),
+        # parked -> the cert-bearing vhost
+        "oxidev.ro": mss._Candidate("oxidev-systems.ro", "oxidevsy", "parked"),
     }
 
 
@@ -859,6 +870,7 @@ def test_mail_sni_detects_parked_domain_on_main_domain_cert(tmp_path, monkeypatc
         tmp_path, monkeypatch, _PARKED_USERDATA, _SNI_ONLY_MAIN,
         ca_domains={"oxidev-systems.ro"},
         covers={"oxidev-systems.ro": {"oxidev.ro", "*.oxidev.ro"}},
+        mailboxes={"oxidev.ro"},
     )
     runner = Runner()
     assert mss._domains_missing_from_sni(runner) == ["oxidev.ro"]
@@ -874,6 +886,7 @@ def test_mail_sni_ignores_domain_the_vhost_cert_does_not_cover(tmp_path, monkeyp
         tmp_path, monkeypatch, _PARKED_USERDATA, _SNI_ONLY_MAIN,
         ca_domains={"oxidev-systems.ro"},
         covers={},           # cert covers only oxidev-systems.ro
+        mailboxes={"oxidev.ro"},
     )
     assert mss._domains_missing_from_sni(Runner()) == []
 
@@ -884,3 +897,62 @@ def test_mail_sni_name_covered_matches_one_level_wildcard():
     assert mss._name_covered("mail.example.com", names)
     assert not mss._name_covered("a.b.example.com", names)   # wildcard is one level
     assert not mss._name_covered("other.com", names)
+
+
+# An addon domain with a CA certificate but no email accounts. cPanel's own
+# dovecotSNI builder leaves such a domain out of mail SNI on purpose, so
+# build_mail_sni can never add it. Flagging it left the patch NOT APPLIED for
+# good and made every post-upcp reapply rebuild SNI, restart Dovecot/Exim and
+# fail again (seen with iuliascs.ro, an addon of the whmcs account).
+_ADDON_USERDATA = (
+    "crocky.example: whmcs==root==main==crocky.example==/home/whmcs/public_html==1.2.3.4\n"
+    "shop.example: whmcs==root==addon==shop.crocky.example==/home/whmcs/shop==1.2.3.4\n"
+    "shop.crocky.example: whmcs==root==sub==crocky.example==/home/whmcs/shop==1.2.3.4\n"
+)
+_SNI_ONLY_CROCKY = (
+    'local_name "crocky.example" {\n  ssl_server_cert_file = /x\n}\n'
+    'local_name "*.crocky.example" {\n  ssl_server_cert_file = /x\n}\n'
+)
+
+
+def test_mail_sni_ignores_addon_without_mailboxes(tmp_path, monkeypatch):
+    _sni_env(
+        tmp_path, monkeypatch, _ADDON_USERDATA, _SNI_ONLY_CROCKY,
+        ca_domains={"crocky.example", "shop.crocky.example"},
+        covers={"shop.crocky.example": {"shop.example", "*.shop.example"}},
+        mailboxes=(),
+    )
+    runner = Runner()
+    assert mss._domains_missing_from_sni(runner) == []
+    assert MailSniSyncPatch().state(runner) == PatchState.APPLIED
+
+
+def test_mail_sni_flags_addon_once_it_has_a_mailbox(tmp_path, monkeypatch):
+    # The same addon with one email account is exactly what cPanel *does* wire
+    # into mail SNI, so its absence is real drift and must still be reported.
+    _sni_env(
+        tmp_path, monkeypatch, _ADDON_USERDATA, _SNI_ONLY_CROCKY,
+        ca_domains={"crocky.example", "shop.crocky.example"},
+        covers={"shop.crocky.example": {"shop.example", "*.shop.example"}},
+        mailboxes={"shop.example"},
+    )
+    assert mss._domains_missing_from_sni(Runner()) == ["shop.example"]
+
+
+def test_mail_sni_main_domain_needs_no_mailbox(tmp_path, monkeypatch):
+    # An account's main domain gets mail SNI regardless of mailboxes (cPanel
+    # includes every trueuserdomain), so a missing main stays flagged.
+    _sni_env(tmp_path, monkeypatch, _USERDATA, _SNI_ONLY_GOOD,
+             ca_domains={"good.example", "broken.example"}, mailboxes=())
+    assert mss._domains_missing_from_sni(Runner()) == ["broken.example"]
+
+
+def test_mail_sni_mailbox_count_ignores_blank_and_comment_lines(tmp_path, monkeypatch):
+    etc = tmp_path / "bob" / "etc" / "b.example"
+    etc.mkdir(parents=True)
+    (etc / "passwd").write_text("\n# note\na:x:1:1::/h:/bin/false\nb:x:1:1::/h:/bin/false\n")
+    monkeypatch.setattr(mss, "_user_home", lambda user: str(tmp_path / user))
+    runner = Runner()
+    assert mss._mailbox_count(runner, "bob", "b.example") == 2
+    assert mss._mailbox_count(runner, "bob", "none.example") == 0
+    assert mss._mailbox_count(runner, "", "b.example") == 0

@@ -42,12 +42,20 @@ host it simply rewrites the same content.
 Model
 -----
 A single component, ``sni_synced``, reports **present** only while *every*
-cPanel-managed domain that has a CA-issued web certificate also appears in
-``/etc/dovecot/sni.conf``. Freshly created accounts that still carry only a
-self-signed placeholder are intentionally ignored (cPanel does not give those a
-mail SNI entry either), and the server's own hostname certificate — the global
-default Dovecot/Exim cert, which needs no ``local_name`` — is excluded, so a
-healthy host reads cleanly **APPLIED** rather than perpetually drifting.
+domain that cPanel itself would give mail SNI also appears in
+``/etc/dovecot/sni.conf``. That set mirrors ``Cpanel::AdvConfig::dovecotSNI``:
+
+* an account's **main** domain is always eligible;
+* an **addon/parked** domain is eligible only while it has at least one email
+  account (``~<user>/etc/<domain>/passwd``) — cPanel deliberately leaves a
+  mailbox-less addon out of mail SNI, so ``build_mail_sni`` can never add it;
+* web-only ``sub`` domains are never eligible;
+* the domain must own a *CA-issued* certificate that actually names it
+  (self-signed placeholders are ignored).
+
+Flagging anything cPanel refuses to wire up would leave the patch permanently
+**NOT APPLIED**, and the post-upcp ``reapply`` would rebuild SNI and restart
+Dovecot/Exim every night only to fail again.
 
 Applying the patch enrolls it, so the post-upcp self-heal hook's ``reapply`` will
 rebuild mail SNI again if a later cPanel update (or a certificate renewal that
@@ -57,14 +65,15 @@ re-break secure mail, so it is never done.
 
 Components
 ----------
-1. ``sni_synced``  every CA-secured managed domain is present in the Dovecot mail
-                   SNI; healed with ``build_mail_sni --rebuild_dovecot_sni_conf``.
+1. ``sni_synced``  every CA-secured, mail-bearing domain is present in the Dovecot
+                   mail SNI; healed with ``build_mail_sni --rebuild_dovecot_sni_conf``.
 """
 from __future__ import annotations
 
 import os
+import pwd
 import re
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, NamedTuple, Set, Tuple
 
 from ..core import Component, Patch, Runner, RunnerError
 
@@ -97,17 +106,23 @@ def _covered_by_sni(domain: str, localnames: Set[str]) -> bool:
     return bool(parent) and f"*.{parent}" in localnames
 
 
-def _sni_candidate_domains(r: Runner) -> Dict[str, str]:
-    """Map each mail-SNI candidate domain to the vhost whose certificate serves it.
+class _Candidate(NamedTuple):
+    vhost: str   # the vhost whose apache_tls certificate serves the domain
+    user: str    # the cPanel account that owns the domain
+    dtype: str   # main / addon / parked
+
+
+def _sni_candidate_domains(r: Runner) -> Dict[str, _Candidate]:
+    """Map each mail-SNI candidate domain to its vhost, owner and type.
 
     Candidates are the main/addon/parked entries of ``/etc/userdatadomains``
-    (user-created ``sub`` domains are excluded). The value is the account's main
-    domain, because that is the name cPanel files the certificate under: a parked
-    domain like ``oxidev.ro`` has no ``apache_tls/oxidev.ro`` of its own and is
-    served by ``apache_tls/oxidev-systems.ro``, whose SAN list covers it.
+    (user-created ``sub`` domains are excluded). The vhost is the name cPanel
+    files the certificate under: a parked domain like ``oxidev.ro`` has no
+    ``apache_tls/oxidev.ro`` of its own and is served by
+    ``apache_tls/oxidev-systems.ro``, whose SAN list covers it.
     """
     text = r.read(USERDATADOMAINS) or ""
-    doms: Dict[str, str] = {}
+    doms: Dict[str, _Candidate] = {}
     for line in text.splitlines():
         domain, sep, rest = line.partition(":")
         if not sep:
@@ -122,8 +137,36 @@ def _sni_candidate_domains(r: Runner) -> Dict[str, str]:
         idx = fields.index(dtype)
         vhost = fields[idx + 1] if idx + 1 < len(fields) else ""
         name = domain.strip().lower()
-        doms[name] = vhost or name
+        doms[name] = _Candidate(vhost or name, raw[0] if raw else "", dtype)
     return doms
+
+
+def _user_home(user: str) -> str:
+    try:
+        return pwd.getpwnam(user).pw_dir
+    except (KeyError, TypeError):
+        return os.path.join("/home", user)
+
+
+def _mailbox_count(r: Runner, user: str, domain: str) -> int:
+    """Email accounts ``domain`` has, read from the Dovecot/Exim auth file
+    ``~<user>/etc/<domain>/passwd`` (one ``local:hash:...`` line per mailbox)."""
+    if not user:
+        return 0
+    text = r.read(os.path.join(_user_home(user), "etc", domain, "passwd")) or ""
+    return sum(1 for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#"))
+
+
+def _wants_mail_sni(r: Runner, domain: str, cand: _Candidate) -> bool:
+    """Whether cPanel itself would give ``domain`` a mail SNI entry.
+
+    Mirrors ``Cpanel::AdvConfig::dovecotSNI::_filter_domains_for_sni_config``: an
+    account's main domain always qualifies, any other domain only while it has
+    at least one email account. A mailbox-less addon is left out by design, so
+    ``build_mail_sni`` will never add it -- flagging it made the patch fail its
+    heal on every post-upcp run.
+    """
+    return cand.dtype == "main" or _mailbox_count(r, cand.user, domain) > 0
 
 
 def _is_ca_signed(r: Runner, cert_path: str) -> bool:
@@ -162,13 +205,17 @@ def _name_covered(domain: str, names: Set[str]) -> bool:
 
 
 def _domains_missing_from_sni(r: Runner) -> List[str]:
-    """main/addon/parked domains that own a real (CA) web cert but present the
-    wrong certificate on the mail ports because they are absent from mail SNI."""
+    """Domains cPanel would give mail SNI (main, or addon/parked with mailboxes)
+    that own a real (CA) web cert but present the wrong certificate on the mail
+    ports because they are absent from mail SNI."""
     localnames = _sni_localnames(r)
     missing: List[str] = []
-    for domain, vhost in sorted(_sni_candidate_domains(r).items()):
+    for domain, cand in sorted(_sni_candidate_domains(r).items()):
         if _covered_by_sni(domain, localnames):
             continue  # already presents its own cert on the mail ports
+        if not _wants_mail_sni(r, domain, cand):
+            continue  # cPanel deliberately gives this domain no mail SNI
+        vhost = cand.vhost
         # The certificate is filed under the vhost, not the domain: a parked or
         # addon domain has no apache_tls directory of its own. Looking it up by
         # domain silently skipped exactly those, so a parked domain could sit on
@@ -197,8 +244,10 @@ class MailSniSyncPatch(Patch):
         "not (re)built, Dovecot and Exim keep presenting the server's hostname certificate "
         "on mail.<domain>. Mail clients that validate certificates then reject the secure "
         "IMAP/POP/SMTP ports (993/995/465/587) with a name mismatch and fall back to "
-        "plaintext or fail to connect entirely. This patch detects any cPanel-managed "
-        "domain that owns a real certificate yet is missing from /etc/dovecot/sni.conf and "
+        "plaintext or fail to connect entirely. This patch detects any domain that cPanel "
+        "should wire into mail SNI (an account's main domain, or an addon/parked domain "
+        "with at least one email account) that owns a real certificate yet is missing "
+        "from /etc/dovecot/sni.conf and "
         "heals it by running 'build_mail_sni --rebuild_dovecot_sni_conf --restartsrvs', "
         "which rewrites the SNI include and restarts the mail services. Once applied it is "
         "enrolled, so the post-upcp self-heal hook re-syncs mail SNI after updates or "
@@ -224,7 +273,7 @@ class MailSniSyncPatch(Patch):
         return [
             Component(
                 "sni_synced",
-                "every CA-secured managed domain presents its own cert on the mail ports",
+                "every CA-secured, mail-bearing domain presents its own cert on the mail ports",
                 self._synced_present,
                 self._synced_apply,
                 self._synced_remove,
@@ -261,4 +310,4 @@ class MailSniSyncPatch(Patch):
         if missing:
             shown = ", ".join(missing[:5]) + ("…" if len(missing) > 5 else "")
             return False, f"{len(missing)} domain(s) missing from mail SNI: {shown}"
-        return True, "all CA-secured managed domains present in mail SNI"
+        return True, "all CA-secured, mail-bearing domains present in mail SNI"
