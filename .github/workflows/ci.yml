@@ -23,7 +23,9 @@ jobs:
         run: ruff check .
 
   test:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is 26.04, which has no Python 3.8/3.9 builds and
+    # would fail the oldest matrix entries before running a single test.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
