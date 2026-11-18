@@ -1,0 +1,12 @@
+# cpanel-doctor:lastlogin-date
+[Unit]
+Description=cPanel Doctor: correct cPanel last-login dates every minute
+Documentation=https://github.com/CrockyHost/cpanel-doctor/blob/main/PATCHES.md
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

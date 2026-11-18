@@ -9,6 +9,7 @@ detection, idempotent apply, surgical re-apply and clean removal all come for fr
 |----|-------|
 | [`account-startdate`](#account-startdate--new-accounts-get-a-past-creation-date) | new accounts recorded with a creation date in the past |
 | [`https-redirect-date`](#https-redirect-date--force-https-redirect-greyed-out) | greyed-out **Force HTTPS Redirect** toggle |
+| [`lastlogin-date`](#lastlogin-date--logins-recorded-with-a-wrong-date) | every cPanel login recorded with the same wrong date in `~/.lastlogin` |
 | [`lshttpd-pidfile`](#lshttpd-pidfile--litespeed-systemd-unit-points-at-the-wrong-pid-file) | `systemctl restart lshttpd` timing out after 90s and leaving the unit failed |
 | [`lsws-ssl-reload`](#lsws-ssl-reload--new-certificates-are-not-served-until-litespeed-restarts) | a newly issued certificate not served, the domain answered with the server hostname's cert |
 | [`lsws-suspend-reload`](#lsws-suspend-reload--suspended-accounts-still-served-by-litespeed) | a suspended account whose site keeps serving normally |
@@ -49,6 +50,39 @@ back to `time()` if the clock can't be read.
 Single component `ssl_call`: the vendor file is edited in place (original backed
 up to `ssl_call.pm.orig`). A cPanel update overwrites it → the patch reads as
 **NOT APPLIED** and is restored by `reapply` / the post-upcp hook.
+
+## `lastlogin-date` — logins recorded with a wrong date
+cPanel appends each login to `~/.lastlogin` as `<ip> # <YYYY-MM-DD HH:MM:SS +ZZZZ>`
+(`Cpanel::LastLogin::Tiny`), and Team Manager reads the date back from there. The
+timestamp comes from the **cPanel process clock**. When that process perceives a
+date in the past, often one instant frozen at the last `cpsrvd` restart, every
+login carries the same wrong date while the OS clock is correct:
+
+```
+# date                                      # Wed Nov 18 21:36:30 EET 2026
+# stat -c %y /home/alice/.lastlogin         # 2026-11-18 21:36:12 +0200
+# tail -1 /home/alice/.lastlogin            # 198.51.100.9 # 2026-10-08 20:06:22 +0300
+```
+
+`Cpanel::LastLogin::Tiny` is compiled into the `cpanel` and `cpsrvd` binaries, so
+editing the `.pm` on disk changes nothing. The file's **modification time**,
+however, is set by the kernel from the real clock: it is the true time of the
+login cPanel just appended as the last line. The patch installs a script, run
+every minute by a systemd timer, that copies that mtime into the last line's
+timestamp whenever the two disagree by more than two minutes, then puts the mtime
+back. Earlier lines are never rewritten, and on a host whose cPanel clock is
+right nothing is ever written.
+
+Home directories belong to customers, so each file is handled with the
+**effective uid/gid of its account**, opened with `O_NOFOLLOW`, and skipped
+unless it is a small regular file owned by that account. A symlink planted as
+`.lastlogin` is ignored. `cpanel_doctor_lastlogin_date.pl --check` reports what
+would change without writing.
+
+Components `fixer_script` (`/usr/local/cpanel/scripts/cpanel_doctor_lastlogin_date.pl`)
+and `timer` (`cpanel-doctor-lastlogin-date.{service,timer}`). A new login shows the
+wrong date for up to a minute, until the next run. The patch refuses to install
+on a cPanel build that no longer writes `<ip> # <timestamp>` lines.
 
 ## `lshttpd-pidfile` — LiteSpeed systemd unit points at the wrong PID file
 LiteSpeed ships `lshttpd.service` with `Type=forking` and

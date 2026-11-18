@@ -11,6 +11,7 @@ from cpanel_doctor.patches import mail_sni_sync as mss
 from cpanel_doctor.patches import lshttpd_pidfile as lpf
 from cpanel_doctor.patches import lsws_suspend_reload as lsr
 from cpanel_doctor.patches import lsws_ssl_reload as lsl
+from cpanel_doctor.patches import lastlogin_date as lld
 from cpanel_doctor.patches.account_startdate import AccountStartdatePatch
 from cpanel_doctor.patches.https_redirect_date import HttpsRedirectDatePatch
 from cpanel_doctor.patches.pdns_upcp_removal import PdnsUpcpRemovalPatch
@@ -19,6 +20,7 @@ from cpanel_doctor.patches.lshttpd_pidfile import LshttpdPidfilePatch
 from cpanel_doctor.patches.lsws_suspend_reload import LswsSuspendReloadPatch
 from cpanel_doctor.patches.lsws_ssl_reload import LswsSslReloadPatch
 from cpanel_doctor.patches.pg_cpses import PgCpsesPatch
+from cpanel_doctor.patches.lastlogin_date import LastloginDatePatch
 
 
 def test_patches_discovered():
@@ -34,6 +36,7 @@ def test_patches_discovered():
     assert "lsws-suspend-reload" in registry
     assert "lshttpd-pidfile" in registry
     assert "lsws-ssl-reload" in registry
+    assert "lastlogin-date" in registry
 
 
 def test_pg_cpses_components_well_formed():
@@ -956,3 +959,132 @@ def test_mail_sni_mailbox_count_ignores_blank_and_comment_lines(tmp_path, monkey
     assert mss._mailbox_count(runner, "bob", "b.example") == 2
     assert mss._mailbox_count(runner, "bob", "none.example") == 0
     assert mss._mailbox_count(runner, "", "b.example") == 0
+
+
+# --------------------------------------------------------------------------- #
+# lastlogin-date: ~/.lastlogin must carry the real login date
+# --------------------------------------------------------------------------- #
+def test_lastlogin_date_components_well_formed():
+    patch = LastloginDatePatch()
+    comps = patch.components()
+    assert [c.key for c in comps] == ["fixer_script", "timer"]
+    for c in comps:
+        assert callable(c.present) and callable(c.apply) and callable(c.remove)
+
+
+def test_lastlogin_date_not_applicable_off_cpanel(tmp_path, monkeypatch):
+    monkeypatch.setattr(lld, "USERS_DIR", str(tmp_path / "nope"))
+    patch = LastloginDatePatch()
+    runner = Runner()
+    assert patch.applicable(runner)[0] is False
+    assert patch.state(runner) == PatchState.NOT_APPLICABLE
+
+
+def test_lastlogin_date_refuses_changed_format(tmp_path, monkeypatch):
+    # If cPanel stops writing "<ip> # <timestamp>", the script would misparse the
+    # file, so the patch must stay out.
+    (tmp_path / "users").mkdir()
+    tiny = tmp_path / "Tiny.pm"
+    tiny.write_text('package Cpanel::LastLogin::Tiny;\nmy $content = "$currenthost";\n1;\n')
+    monkeypatch.setattr(lld, "USERS_DIR", str(tmp_path / "users"))
+    monkeypatch.setattr(lld, "TINY_PM", str(tiny))
+    assert LastloginDatePatch().applicable(Runner())[0] is False
+
+
+def test_lastlogin_date_script_roundtrip(tmp_path, monkeypatch):
+    script = tmp_path / "fix.pl"
+    monkeypatch.setattr(lld, "SCRIPT_PATH", str(script))
+    comp = {c.key: c for c in LastloginDatePatch().components()}["fixer_script"]
+    runner = Runner()
+
+    assert comp.present(runner) is False
+    comp.apply(runner)
+    assert comp.present(runner) is True
+    assert lld.MARKER in script.read_text()
+    assert oct(script.stat().st_mode & 0o777) == "0o700"
+    comp.remove(runner)
+    assert comp.present(runner) is False
+
+
+def test_lastlogin_date_units_carry_marker():
+    from cpanel_doctor.core import asset_text
+
+    service = asset_text(lld.SERVICE_NAME)
+    timer = asset_text(lld.TIMER_NAME)
+    assert lld.MARKER in service and lld.MARKER in timer
+    assert lld.SCRIPT_PATH in service
+    assert "OnUnitActiveSec=1min" in timer
+
+
+def _run_fixer(tmp_path, *args):
+    import shutil
+    import subprocess
+
+    import pytest
+
+    perl = shutil.which("perl")
+    if not perl:
+        pytest.skip("perl not installed")
+    from cpanel_doctor.core import asset_text
+
+    script = tmp_path / "fix.pl"
+    script.write_text(asset_text(lld.SCRIPT_ASSET))
+    return subprocess.run([perl, str(script), *args], capture_output=True, text=True,
+                          env={"PATH": "/usr/bin:/bin", "TZ": "UTC"})
+
+
+def test_lastlogin_date_fixer_copies_mtime_into_last_line(tmp_path):
+    # cPanel stamped both logins with one frozen instant; the file's mtime is the
+    # real time of the newest one. Only the last line changes, and the mtime is
+    # put back so the next pass is a no-op.
+    ll = tmp_path / ".lastlogin"
+    ll.write_text("203.0.113.7 # 2026-10-08 20:06:22 +0300\n"
+                  "198.51.100.9 # 2026-10-08 20:06:22 +0300")
+    real = 1795029503  # 2026-11-18 19:18:23 UTC
+    os.utime(ll, (real, real))
+
+    res = _run_fixer(tmp_path, str(ll))
+    assert res.returncode == 0, res.stderr
+    assert "fixed=1" in res.stdout
+    assert ll.read_text() == ("203.0.113.7 # 2026-10-08 20:06:22 +0300\n"
+                              "198.51.100.9 # 2026-11-18 19:18:23 +0000")
+    assert int(ll.stat().st_mtime) == real
+
+    again = _run_fixer(tmp_path, str(ll))
+    assert "ok=1" in again.stdout and "fixed" not in again.stdout
+
+
+def test_lastlogin_date_fixer_leaves_correct_dates_alone(tmp_path):
+    ll = tmp_path / ".lastlogin"
+    body = "198.51.100.9 # 2026-11-18 19:18:23 +0000"
+    ll.write_text(body)
+    real = 1795029503 + 30  # written 30s after the stamp: within tolerance
+    os.utime(ll, (real, real))
+    res = _run_fixer(tmp_path, str(ll))
+    assert "ok=1" in res.stdout
+    assert ll.read_text() == body
+
+
+def test_lastlogin_date_fixer_check_mode_writes_nothing(tmp_path):
+    ll = tmp_path / ".lastlogin"
+    body = "198.51.100.9 # 2026-10-08 20:06:22 +0300"
+    ll.write_text(body)
+    os.utime(ll, (1795029503, 1795029503))
+    res = _run_fixer(tmp_path, "--check", str(ll))
+    assert "would-fix=1" in res.stdout
+    assert ll.read_text() == body
+
+
+def test_lastlogin_date_fixer_skips_symlinks_and_garbage(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("198.51.100.9 # 2026-10-08 20:06:22 +0300")
+    os.utime(victim, (1795029503, 1795029503))
+    link = tmp_path / ".lastlogin"
+    link.symlink_to(victim)
+    junk = tmp_path / "junk"
+    junk.write_text("not a lastlogin line")
+
+    res = _run_fixer(tmp_path, str(link), str(junk))
+    assert "skip=2" in res.stdout
+    assert victim.read_text() == "198.51.100.9 # 2026-10-08 20:06:22 +0300"
+    assert junk.read_text() == "not a lastlogin line"

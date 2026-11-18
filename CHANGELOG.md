@@ -3,6 +3,18 @@
 All notable changes to **cPanel Doctor** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] — 2026-11-18
+### Added
+- `lastlogin-date` patch — fixes **every cPanel login recorded with the same wrong
+  date**. cPanel stamps `~/.lastlogin` (and, through it, Team Manager) from its own
+  process clock, which on affected hosts is frozen at the last `cpsrvd` restart:
+  on web-c2 all 23 accounts showed `2026-10-08 20:06:22` or an older frozen
+  instant (2026-08-25, 2026-09-08, 2026-09-15). The writer is compiled into the
+  `cpanel`/`cpsrvd` binaries, so it cannot be edited. A systemd timer now copies
+  the file's kernel-set mtime, the real time of the newest login, into the last
+  line every minute, working as the account's own uid and never following
+  symlinks.
+
 ## [0.6.2] — 2026-11-15
 ### Fixed
 - `mail-sni-sync` was stuck **NOT APPLIED** and restarted Dovecot/Exim every night

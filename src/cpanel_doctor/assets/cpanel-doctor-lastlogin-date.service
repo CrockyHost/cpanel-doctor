@@ -1,0 +1,10 @@
+# cpanel-doctor:lastlogin-date
+[Unit]
+Description=cPanel Doctor: record the real date of cPanel logins in ~/.lastlogin
+Documentation=https://github.com/CrockyHost/cpanel-doctor/blob/main/PATCHES.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/cpanel/3rdparty/bin/perl /usr/local/cpanel/scripts/cpanel_doctor_lastlogin_date.pl
+Nice=10
+IOSchedulingClass=idle
